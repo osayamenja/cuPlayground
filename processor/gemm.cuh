@@ -6,9 +6,6 @@
 #define GEMM_CUH
 
 #include <cublasdx.hpp>
-#include <cuda/std/detail/libcxx/include/cstddef>
-#include <cuda/std/concepts>
-#include <cuda/std/type_traits>
 
 template<class GEMM>
 __global__ void gemm_kernel(const typename GEMM::c_value_type  alpha,

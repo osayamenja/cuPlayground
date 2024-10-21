@@ -22,8 +22,9 @@ check_compiler_flag(CUDA -t4 NVCC_THREADS)
 
 find_package(CUDAToolkit REQUIRED)
 
-find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+set(CAFFE2_USE_CUDNN ON)
+#find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 add_executable(cuPlayground main.cu
         processor/gemm.cuh)
@@ -33,7 +34,8 @@ set_target_properties(cuPlayground PROPERTIES
 )
 
 #Link torch
-target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
+#target_precompile_headers(cuPlayground PRIVATE torchInclude.h)
+#target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
 #CPM
 set(ENV{CPM_USE_LOCAL_PACKAGES} ON)
 set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
@@ -84,10 +86,12 @@ target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 target_link_libraries(cuPlayground PRIVATE nvshmem::nvshmem)
 
+string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 target_compile_options(cuPlayground PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -v;--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-t0; --generate-line-info>
+        $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=sm_${COMPUTE_CAPABILITY}>
         # Required to support std::tuple in device code
 )
 
@@ -101,5 +105,6 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:CUDA>:-O3>
             $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -O3>
+            #$<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=lto_${COMPUTE_CAPABILITY}>
     )
 endif ()

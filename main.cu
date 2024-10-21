@@ -14,7 +14,7 @@
 #include <nvshmemx.h>
 #include <nvshmem.h>
 #include <host/nvshmemx_api.h> // Makes CLion happy
-#include <torch/torch.h>
+//#include "torchInclude.h"
 #include "processor/gemm.cuh"
 
 #define NANO_TO_MICRO (cuda::std::nano::den / cuda::std::micro::den)
@@ -164,18 +164,20 @@ enum signal : unsigned short {
 };
 
 #define STAGES 2U
-template<typename T, unsigned int stage=0> requires (stage < STAGES)
+#define CELLS 2U
+template<typename T, unsigned int stage=0>
+requires (stage < STAGES && !cuda::std::is_same_v<T, void>) // Pointer arithmetic on void is undefined
 CUTE_DEVICE
-T* advanceHeap(const T* __restrict__ buffer, const unsigned int& bid, const unsigned int& slotSize) {
-    return buffer + slotSize * ((STAGES * bid) + stage);
+T* advanceHeap(T* const& __restrict__ buffer, const unsigned int& slotSize) {
+    return buffer + slotSize * (STAGES + stage);
 }
-
 
 template<class GEMM, unsigned short world, unsigned short rounds, bool skip=true>
 requires (GEMM::block_dim >= STAGES)
 __global__ void overlapKernel(const typename GEMM::b_value_type* __restrict__ weights,
     const typename GEMM::c_value_type* __restrict__ result,
-    void* __restrict__ sHeap, uint64_t* __restrict__ flags,
+    cuda::std::byte* __restrict__ sHeap, cuda::std::byte* __restrict__ staging,
+    uint64_t* __restrict__ flags,
     CUTE_GRID_CONSTANT const int rank) {
     // The workflow operates as follows, assuming each PE has a weight matrix and starts with an input matrix.
     // 1. At time i A2A to disseminate vector v_i
@@ -193,6 +195,8 @@ __global__ void overlapKernel(const typename GEMM::b_value_type* __restrict__ we
     if (tid == 0) {
         // grid::block_rank() == peer rank
         bid = cooperative_groups::grid_group::block_rank();
+        sHeap += STAGES * GEMM::c_size * bid;
+        staging += GEMM::c_size * bid;
     }
     __threadfence_block();
     __syncthreads();
@@ -217,45 +221,44 @@ __global__ void overlapKernel(const typename GEMM::b_value_type* __restrict__ we
     CUTE_UNROLL
     for (unsigned short i = 0; i < rounds; ++i) {
         // upper bound of number of messages per round
-        memcpy_async(cooperative_groups::this_thread_block(), advanceHeap(sHeap, bid, GEMM::c_size), sC, GEMM::c_size);
+        memcpy_async(cooperative_groups::this_thread_block(), staging, sC, GEMM::c_size);
         wait(cooperative_groups::this_thread_block());
         // Communicate vector to peer
-        // TODO add send and receive cells
-        nvshmemx_putmem_signal_nbi_block(advanceHeap(sHeap, bid, GEMM::c_size),
-            advanceHeap(sHeap, bid, GEMM::c_size), (bid != rank) * GEMM::c_size,
+        nvshmemx_putmem_signal_nbi_block(advanceHeap<0>(sHeap, GEMM::c_size),
+            staging, (bid != rank) * GEMM::c_size,
             flags + bid, shouldProcess, NVSHMEM_SIGNAL_SET, bid);
 
         if (!tid) {
             // Await data arrival
-            nvshmem_signal_wait_until(flags + bid, NVSHMEM_CMP_GT, NOOP);
+            nvshmem_signal_wait_until(flags + bid, NVSHMEM_CMP_EQ, shouldProcess);
         }
         __syncthreads();
 
         /// First stage
         // Copy received data to shared memory workspace
         cooperative_groups::memcpy_async(cooperative_groups::this_thread_block(), sA,
-            advanceHeap(sHeap, bid, GEMM::c_size), GEMM::c_size);
+            advanceHeap<0>(sHeap, GEMM::c_size), GEMM::c_size);
         wait(cooperative_groups::this_thread_block());
         // Execute GEMM
         GEMM().execute(GEMM::a_value_type(1.0), tAsA, tBsB, GEMM::c_value_type(0.0), tCsC);
         __syncthreads();
 
-        memcpy_async(cooperative_groups::this_thread_block(), advanceHeap(sHeap, bid, GEMM::c_size), sC, GEMM::c_size);
+        memcpy_async(cooperative_groups::this_thread_block(), staging, sC, GEMM::c_size);
         wait(cooperative_groups::this_thread_block());
 
         // Eagerly communicate computed vector to peer
-        nvshmemx_putmem_signal_nbi_block(advanceHeap<1>(sHeap, bid, GEMM::c_size),
-            advanceHeap<1>(sHeap, bid, GEMM::c_size), (bid != rank) * GEMM::c_size,
+        nvshmemx_putmem_signal_nbi_block(advanceHeap<1>(sHeap, GEMM::c_size),
+            staging, (bid != rank) * GEMM::c_size,
             flags + world + bid, processed, NVSHMEM_SIGNAL_SET, bid);
 
         // Second Stage
         if (!tid) {
             // Await data arrival
-            nvshmem_signal_wait_until(flags + world + bid, NVSHMEM_CMP_GT, NOOP);
+            nvshmem_signal_wait_until(flags + world + bid, NVSHMEM_CMP_EQ, processed);
         }
         __syncthreads();
         cooperative_groups::memcpy_async(cooperative_groups::this_thread_block(), sA,
-            advanceHeap<1>(sHeap, bid, GEMM::c_size), GEMM::c_size);
+            advanceHeap<1>(sHeap, GEMM::c_size), GEMM::c_size);
         wait(cooperative_groups::this_thread_block());
 
         // Fused GEMM and ReLU
@@ -272,6 +275,7 @@ void overlapPrototype() {
     // blocks should be equal to n
     nvshmem_init();
     CUTE_CHECK_ERROR(cudaSetDevice(nvshmem_team_my_pe(NVSHMEMX_TEAM_NODE)));
+    // total memory = GEMM::c_size * n * (STAGES + 1) -> STAGES and staging buffer
     auto* p = nvshmem_align(16, 2*sizeof(float)*nvshmem_n_pes());
     CUTE_CHECK_ERROR(cudaMemset(p, 0, nBytes));
     cudaEvent_t start, stop;
@@ -302,33 +306,13 @@ void testArrangement() {
     fmt::println("a[0][1] is {}, a[1][1] is {}", tT(0,1), tT(1,1));
 }
 
-void testTorch() {
-    using tensorType = float;
-    constexpr unsigned int s = 4;
-    cuda::std::array<tensorType,s> aData{{0.0, 1.0, 2.0, 3.0}};
-    const auto a = torch::from_blob(aData.data(), {2,2});
-    std::cout << a << std::endl;
-    std::ranges::transform(aData.begin(), aData.end(), aData.begin(), [](const tensorType& v) {
-       return v + s;
-    });
-    const auto b = torch::from_blob(aData.data(), {2,2});
-    std::cout << b << std::endl;
-    std::cout << mm(a, b) << std::endl;
+template<unsigned int Arch>
+__global__ void testArch() {
+    printf("%u", 5);
 }
 
-void tx(size_t p) {
-
-}
 int main() {
-    /*tx(q);
-    testGEMM();*/
-    auto s = signal(45);
-    std::cout << s << std::endl;
-    /*constexpr std::array<float, 2>a{{0,1}};
-    constexpr std::array<float, 2>b{{2,3}};
-    auto t = cute::make_tensor(a.data(), cute::make_shape(1,2));
-    cute::print_tensor(t);
-    t.data() = b.data();
-    cute::print_tensor(t);*/
-    //overlapPrototype();
+    testArch<800><<<1,1>>>();
+    //testGEMM();
+    return 0;
 }

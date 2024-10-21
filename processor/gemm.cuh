@@ -12,14 +12,14 @@ __global__ void gemm_kernel(const typename GEMM::c_value_type  alpha,
                             const typename GEMM::a_value_type* a,
                             const typename GEMM::b_value_type* b,
                             const typename GEMM::c_value_type  beta,
-                            typename GEMM::c_value_type* c) {
+                            typename GEMM::c_value_type* c, bool skip = false) {
     extern __shared__ __align__(16) char smem[];
 
     // Make global memory tensor
     auto a_global_tensor = cublasdx::make_tensor(a, GEMM::get_layout_gmem_a());
     auto b_global_tensor = cublasdx::make_tensor(b, GEMM::get_layout_gmem_b());
     auto c_global_tensor = cublasdx::make_tensor(c, GEMM::get_layout_gmem_c());
-    if (cute::thread0()) {
+    if (cute::thread0() && !skip) {
         cute::print_tensor(a_global_tensor);
         cute::print_tensor(b_global_tensor);
     }
@@ -39,11 +39,11 @@ __global__ void gemm_kernel(const typename GEMM::c_value_type  alpha,
 
     // Execute GEMM
     GEMM().execute(alpha, a_shared_tensor, b_shared_tensor, beta, c_shared_tensor);
-    __syncthreads();
-    if (cute::thread0()) {
+    if (cute::thread0() && !skip) {
         cute::print_tensor(c_shared_tensor);
     }
 
+    __syncthreads();
     // Store data from shared memory tensor to global memory tensor
     cublasdx::copy<GEMM, alignment::c>(c_shared_tensor, c_global_tensor);
 }
@@ -57,7 +57,7 @@ int introduction_example() {
     using GEMM = decltype(cublasdx::Size<M, N, K>()
                   + cublasdx::Precision<value_type>()
                   + cublasdx::Type<cublasdx::type::real>()
-                  + cublasdx::Arrangement<cublasdx::row_major, cublasdx::col_major, cublasdx::row_major>()
+                  + cublasdx::Arrangement<cublasdx::row_major>()
                   + cublasdx::Function<cublasdx::function::MM>()
                   + cublasdx::SM<Arch>()
                   + cublasdx::Block());
@@ -82,7 +82,7 @@ int introduction_example() {
     value_type* c = abc + global_a_size + global_b_size;
 
     // Invokes kernel with GEMM::block_dim threads in CUDA block
-    gemm_kernel<GEMM><<<1, GEMM::block_dim, GEMM::shared_memory_size>>>(1.0, a, b, 0.0, c);
+    gemm_kernel<GEMM><<<1, GEMM::block_dim, GEMM::shared_memory_size>>>(1.0f, a, b, 0.0f, c);
     CUTE_CHECK_ERROR(cudaPeekAtLastError());
     CUTE_CHECK_ERROR(cudaDeviceSynchronize());
     std::array<value_type, M*N> result {};

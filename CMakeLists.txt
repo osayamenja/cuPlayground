@@ -1,4 +1,17 @@
 cmake_minimum_required(VERSION 3.30)
+
+if(DEFINED ENV{NERSC_HOST})
+    execute_process(COMMAND "which" "g++"
+            COMMAND_ERROR_IS_FATAL ANY
+            OUTPUT_VARIABLE CPP_COMP_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND "which" "gcc"
+            COMMAND_ERROR_IS_FATAL ANY
+            OUTPUT_VARIABLE C_COMP_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    set(CMAKE_CXX_COMPILER ${CPP_COMP_PATH})
+    set(CMAKE_C_COMPILER ${C_COMP_PATH})
+endif ()
+
 project(cuPlayground CUDA CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -45,6 +58,7 @@ set(CCCL_ENABLE_UNSTABLE ON)
 CPMAddPackage(
         NAME CCCL
         GITHUB_REPOSITORY nvidia/cccl
+        FORCE 1
         GIT_TAG main # Fetches the latest commit on the main branch
 )
 if(CCCL_ADDED)
@@ -85,6 +99,25 @@ target_link_libraries(cuPlayground PRIVATE mathdx::cublasdx)
 target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::nvml CUDA::nvtx3)
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 target_link_libraries(cuPlayground PRIVATE nvshmem::nvshmem)
+
+if(DEFINED ENV{NERSC_HOST})
+    find_library(NCCL
+            NAMES libnccl_static.a
+            HINTS "$ENV{NCCL_HOME}"
+            REQUIRED
+    )
+    target_link_libraries(cuPlayground PRIVATE "${NCCL}")
+    target_include_directories(cuPlayground SYSTEM PRIVATE "$ENV{NCCL_HOME}/include")
+endif ()
+
+# Link Cray's GPU-accelerated MPICH
+if(DEFINED ENV{LINK_GTL} AND DEFINED ENV{NERSC_HOST} AND "$ENV{NERSC_HOST}" STREQUAL "perlmutter")
+    find_library(GTL
+            NAMES libmpi_gtl_cuda.so.0
+            HINTS /opt/cray/pe/lib64/
+            REQUIRED)
+    target_link_libraries(cuPlayground PRIVATE "${GTL}")
+endif ()
 
 string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 target_compile_options(cuPlayground PRIVATE

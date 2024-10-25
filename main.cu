@@ -8,6 +8,8 @@
 #include <cuda/std/array>
 #include <cuda/std/chrono>
 #include <cutlass/epilogue/thread/activation.h>
+#include "cutlass/gemm/dispatch_policy.hpp"
+#include "cutlass/gemm/collective/collective_mma.hpp"
 #include <fmt/ranges.h>
 #include <cuda.h>
 #include <nccl.h>
@@ -15,6 +17,7 @@
 #include <nvshmem.h>
 #include <host/nvshmemx_api.h> // Makes CLion happy
 #include "processor/gemm.cuh"
+#include "processor/tiling.cuh"
 
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define BYTE_CAST(p) static_cast<cuda::std::byte*>(static_cast<void*>(p))
@@ -182,8 +185,8 @@ requires (cublasdx::is_complete_blas_execution<GEMM>::value
 && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value)
 __global__ void overlapKernel(const typename GEMM::a_value_type* __restrict__ inputs,
     const typename GEMM::b_value_type* __restrict__ weights, cuda::std::byte* __restrict__ staging,
-    uint64_t* __restrict__ flags, cuda::std::byte* sHeap, CUTE_GRID_CONSTANT const unsigned int rank,
-    CUTE_GRID_CONSTANT const unsigned int world) {
+    uint64_t* __restrict__ flags, cuda::std::byte* sHeap, __grid_constant__ const unsigned int rank,
+    __grid_constant__ const unsigned int world) {
     // The workflow operates as follows,
     // assuming each PE has a weight matrix and starts with an input matrix.
     // 1. At time i A2A to disseminate vector v_i
@@ -411,6 +414,68 @@ void testConfig() {
     M, N, K>;
 }
 
+template<class BlockMM, class ProblemShape>
+requires (cublasdx::is_complete_blas<BlockMM>::value
+&& cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value)
+__global__ void testCollectiveMMA(ProblemShape shapeMNK,
+    const typename BlockMM::a_value_type* __restrict__ inputs,
+    const typename BlockMM::b_value_type* __restrict__ weights,
+    typename BlockMM::c_value_type* __restrict__ result) {
+    constexpr bool isALayoutLeft = cublasdx::arrangement_of<BlockMM>::a == cublasdx::arrangement::col_major;
+    constexpr bool isBLayoutLeft = cublasdx::arrangement_of<BlockMM>::b == cublasdx::arrangement::col_major;
+    constexpr bool isCLayoutLeft = cublasdx::arrangement_of<BlockMM>::c == cublasdx::arrangement::col_major;
+    using optimalConfig = cublasdx::detail::layout_database::optimal_config<128, cublasdx::sm_of<BlockMM>::value,
+    typename BlockMM::a_value_type, isALayoutLeft, cublasdx::alignment_of<BlockMM>::a,
+    typename BlockMM::b_value_type, isBLayoutLeft, cublasdx::alignment_of<BlockMM>::b,
+    typename BlockMM::c_value_type, isCLayoutLeft, cublasdx::alignment_of<BlockMM>::c,
+    cublasdx::size_of<BlockMM>::m, cublasdx::size_of<BlockMM>::n, cublasdx::size_of<BlockMM>::k>;
+
+    using Parameters = GEMMParameters<BlockMM>;
+    constexpr auto bM = cublasdx::size_of<BlockMM>::m;
+    constexpr auto bN = cublasdx::size_of<BlockMM>::n;
+    constexpr auto bK = cublasdx::size_of<BlockMM>::k;
+    using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
+
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
+        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<cute::_1::value>,
+        blockTiler,
+        typename BlockMM::a_value_type,
+        cute::Underscore,
+        typename BlockMM::b_value_type,
+        cute::Underscore,
+        typename Parameters::config::TiledMma,
+        typename Parameters::gCopyA,
+        typename Parameters::config::a_layout,
+        typename Parameters::config::a_copy_op,
+        cute::identity,
+        typename Parameters::gCopyB,
+        typename Parameters::config::b_layout,
+        typename Parameters::config::b_copy_op,
+        cute::identity
+    >;
+
+    typename Parameters::config::TiledMma tiledMMA;
+    using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
+    auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
+
+    // Represent the full tensors
+    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs), cute::select<0,2>(shapeMNK), Parameters::strideA{}); // (M,K)
+    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights), cute::select<1,2>(shapeMNK), Parameters::strideB{}); // (N,K)
+    auto mC = cute::make_tensor(cute::make_gmem_ptr(result), cute::select<0,1>(shapeMNK), Parameters::strideC{}); // (M,N)
+
+
+    // Get the appropriate blocks for this thread block
+    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, cute::_);              // (m,n,k)
+    auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
+    auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
+    auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+
+    auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
+    int k_tile_count = size<2>(gA);
+
+
+}
+
 template<unsigned int Arch>
 __global__ void testArch() {
     printf("%u", 5);
@@ -435,6 +500,9 @@ void testAlloc() {
 }
 
 int main() {
-    overlapPrototype();
+    auto b = cute::Shape<cute::_128, cute::_8>{};
+    auto s = cute::Shape<cute::_32,cute::_8>{};
+    constexpr auto v = cute::_32::value;
+    //overlapPrototype();
     return 0;
 }

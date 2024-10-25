@@ -40,7 +40,8 @@ set(CAFFE2_USE_CUDNN ON)
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 
 add_executable(cuPlayground main.cu
-        processor/gemm.cuh)
+        processor/gemm.cuh
+        processor/tiling.cuh)
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
         CUDA_SEPARABLE_COMPILATION ON

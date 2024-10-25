@@ -12,7 +12,7 @@ __global__ void gemm_kernel(const typename GEMM::c_value_type  alpha,
                             const typename GEMM::a_value_type* a,
                             const typename GEMM::b_value_type* b,
                             const typename GEMM::c_value_type  beta,
-                            typename GEMM::c_value_type* c, bool skip = false) {
+                            typename GEMM::c_value_type* c, const bool skip = false) {
     extern __shared__ __align__(16) char smem[];
 
     // Make global memory tensor

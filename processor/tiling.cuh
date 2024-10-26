@@ -46,12 +46,18 @@ struct GEMMParameters{
                                     cute::Layout<cute::Shape<tLayX, tLayY>>{},
                                     cute::Layout<cute::Shape<vLayX, vLayY>>{}));
 
-    using SM80TiledCopyA = decltype(cute::make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
+    using SM80CopyAtomA = cuda::std::conditional_t<sizeof(typename GEMM::a_value_type) >=4,
+    cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, cute::UniversalCopy<cute::uint128_t>>;
+
+    using SM80TiledCopyA = decltype(cute::make_tiled_copy(cute::Copy_Atom<SM80CopyAtomA,
                                     typename GEMM::a_value_type>{},
                                     cute::Layout<cute::Shape<tLayX, tLayY>>{},
                                     cute::Layout<cute::Shape<vLayX, vLayY>>{}));
 
-    using SM80TiledCopyB = decltype(cute::make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>,
+    using SM80CopyAtomB = cuda::std::conditional_t<sizeof(typename GEMM::b_value_type) >=4,
+    cute::SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, cute::UniversalCopy<cute::uint128_t>>;
+
+    using SM80TiledCopyB = decltype(cute::make_tiled_copy(cute::Copy_Atom<SM80CopyAtomB,
                                     typename GEMM::b_value_type>{},
                                     cute::Layout<cute::Shape<tLayX, tLayY>>{},
                                     cute::Layout<cute::Shape<vLayX, vLayY>>{}));
@@ -59,13 +65,7 @@ struct GEMMParameters{
     using gCopyA = cuda::std::conditional_t<(cublasdx::sm_of<GEMM>::value < 800), SM70TiledCopyA, SM80TiledCopyA>;
     using gCopyB = cuda::std::conditional_t<(cublasdx::sm_of<GEMM>::value < 800), SM70TiledCopyB, SM80TiledCopyB>;
 
-    using config = cublasdx::detail::layout_database::optimal_config<128, cublasdx::sm_of<GEMM>::value,
-    typename GEMM::a_value_type,
-    cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::a,
-    typename GEMM::b_value_type,
-    cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::b,
-    typename GEMM::c_value_type,
-    cublasdx::arrangement_of<GEMM>::c == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::c,
-    cublasdx::size_of<GEMM>::m, cublasdx::size_of<GEMM>::n, cublasdx::size_of<GEMM>::k>;
+    using config = typename GEMM::exec_t::swizzled_config;
+    using mma = typename GEMM::exec_t::mma_t;
 };
 #endif //TILING_CUH

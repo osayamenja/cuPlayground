@@ -416,34 +416,26 @@ void testConfig() {
 
 template<class BlockMM, class ProblemShape>
 requires (cublasdx::is_complete_blas<BlockMM>::value
-&& cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value)
-__global__ void testCollectiveMMA(ProblemShape shapeMNK,
+&& cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
+&& cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
+__global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     const typename BlockMM::a_value_type* __restrict__ inputs,
     const typename BlockMM::b_value_type* __restrict__ weights,
     typename BlockMM::c_value_type* __restrict__ result) {
-    constexpr bool isALayoutLeft = cublasdx::arrangement_of<BlockMM>::a == cublasdx::arrangement::col_major;
-    constexpr bool isBLayoutLeft = cublasdx::arrangement_of<BlockMM>::b == cublasdx::arrangement::col_major;
-    constexpr bool isCLayoutLeft = cublasdx::arrangement_of<BlockMM>::c == cublasdx::arrangement::col_major;
-    using optimalConfig = cublasdx::detail::layout_database::optimal_config<128, cublasdx::sm_of<BlockMM>::value,
-    typename BlockMM::a_value_type, isALayoutLeft, cublasdx::alignment_of<BlockMM>::a,
-    typename BlockMM::b_value_type, isBLayoutLeft, cublasdx::alignment_of<BlockMM>::b,
-    typename BlockMM::c_value_type, isCLayoutLeft, cublasdx::alignment_of<BlockMM>::c,
-    cublasdx::size_of<BlockMM>::m, cublasdx::size_of<BlockMM>::n, cublasdx::size_of<BlockMM>::k>;
-
     using Parameters = GEMMParameters<BlockMM>;
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
     constexpr auto bK = cublasdx::size_of<BlockMM>::k;
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
 
-    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<cute::_1::value>,
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<1>,
         blockTiler,
         typename BlockMM::a_value_type,
         cute::Underscore,
         typename BlockMM::b_value_type,
         cute::Underscore,
-        typename Parameters::config::TiledMma,
+        typename Parameters::mma,
         typename Parameters::gCopyA,
         typename Parameters::config::a_layout,
         typename Parameters::config::a_copy_op,
@@ -473,7 +465,60 @@ __global__ void testCollectiveMMA(ProblemShape shapeMNK,
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
+    extern __shared__ char* buf[];
+    CollectiveMainloop collective_mma;
+    collective_mma(
+        accum,
+        gA,
+        gB,
+        accum,
+        k_tile_iter, k_tile_count,
+        cute::Underscore{},
+        threadIdx.x,
+        buf);
+}
 
+void testCollective() {
+    const auto playStream = cudaStreamPerThread;
+    constexpr auto M = 128U;
+    constexpr auto N = 128U;
+    constexpr auto K = 8U;
+    using inputValueType = float;
+    using weightValueType = float;
+    using outValueType = float;
+    // Do y=xA^T
+    using GEMM = decltype(cublasdx::Size<M, N, K>()
+                          + cublasdx::Precision<inputValueType>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<800>()
+                          + cublasdx::Block());
+
+    constexpr auto abcSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
+    + (sizeof(GEMM::b_value_type) * GEMM::b_size) + (sizeof(GEMM::b_value_type) * GEMM::c_size);
+    cuda::std::byte* abc;
+    CUTE_CHECK_ERROR(cudaMallocAsync(&abc, abcSize, playStream));
+
+    int i = 0;
+    static_assert(sizeof(inputValueType) == sizeof(weightValueType));
+    static_assert(sizeof(inputValueType) == sizeof(outValueType));
+    static_assert(sizeof(weightValueType) == sizeof(outValueType));
+    auto* data = malloc(abcSize);
+#pragma unroll
+    for (;i < GEMM::a_size; ++i) {
+        static_cast<inputValueType*>(data)[i] = static_cast<inputValueType>(i);
+    }
+
+#pragma unroll
+    for (int j = 0; i < GEMM::a_size + GEMM::b_size; ++i, ++j) {
+        static_cast<weightValueType*>(data)[i] = static_cast<weightValueType>(j + 2);
+    }
+    CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
+    constexpr auto problemShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>{};
+    deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape, CAST_TO(inputValueType, abc),
+        CAST_TO(inputValueType, abc + GEMM::a_size), CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));
+    free(data);
 }
 
 template<unsigned int Arch>
@@ -500,9 +545,6 @@ void testAlloc() {
 }
 
 int main() {
-    auto b = cute::Shape<cute::_128, cute::_8>{};
-    auto s = cute::Shape<cute::_32,cute::_8>{};
-    constexpr auto v = cute::_32::value;
-    //overlapPrototype();
+    print(idx2crd(3, cute::Shape<cute::_2, cute::_2>{}));
     return 0;
 }

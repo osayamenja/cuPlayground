@@ -16,8 +16,8 @@
 #include <nvshmemx.h>
 #include <nvshmem.h>
 #include <host/nvshmemx_api.h> // Makes CLion happy
-#include "processor/gemm.cuh"
 #include "processor/tiling.cuh"
+#include "processor/gemm.cuh"
 
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define BYTE_CAST(p) static_cast<cuda::std::byte*>(static_cast<void*>(p))
@@ -390,11 +390,11 @@ void testGEMM() {
 }
 
 void testConfig() {
-    constexpr auto M = 2U;
-    constexpr auto N = 2U;
-    constexpr auto K = 2U;
-    using inputValueType = cublasdx::tfloat32_t;
-    using weightValueType = cublasdx::tfloat32_t;
+    constexpr auto M = 128U;
+    constexpr auto N = 128U;
+    constexpr auto K = 64U;
+    using inputValueType = __half;
+    using weightValueType = __half;
     using outValueType = float;
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<M, N, K>()
@@ -404,17 +404,15 @@ void testConfig() {
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
-    constexpr bool isALayoutLeft = cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::col_major;
-    constexpr bool isBLayoutLeft = cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::col_major;
-    constexpr bool isCLayoutLeft = cublasdx::arrangement_of<GEMM>::c == cublasdx::arrangement::col_major;
-    using optimalConfig = cublasdx::detail::layout_database::optimal_config<128, 800,
-    inputValueType, isALayoutLeft, cublasdx::alignment_of<GEMM>::a,
-    weightValueType, isBLayoutLeft, cublasdx::alignment_of<GEMM>::b,
-    outValueType, isCLayoutLeft, cublasdx::alignment_of<GEMM>::c,
-    M, N, K>;
+
+    using config = cublasdx::detail::layout_database::optimal_config<THREADS, cublasdx::sm_of<GEMM>::value,
+    typename GEMM::a_value_type, cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::a,
+    typename GEMM::b_value_type, cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::b,
+    typename GEMM::c_value_type, cublasdx::arrangement_of<GEMM>::c == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::c,
+    cublasdx::size_of<GEMM>::m, cublasdx::size_of<GEMM>::n, cublasdx::size_of<GEMM>::k>;
 }
 
-template<class BlockMM, class ProblemShape>
+/*template<class BlockMM, class ProblemShape>
 requires (cublasdx::is_complete_blas<BlockMM>::value
 && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
 && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
@@ -422,7 +420,7 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     const typename BlockMM::a_value_type* __restrict__ inputs,
     const typename BlockMM::b_value_type* __restrict__ weights,
     typename BlockMM::c_value_type* __restrict__ result) {
-    using Parameters = GEMMParameters<BlockMM>;
+    using Parameters = CollectiveMMAConfig<BlockMM>;
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
     constexpr auto bK = cublasdx::size_of<BlockMM>::k;
@@ -435,7 +433,7 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
         cute::Underscore,
         typename BlockMM::b_value_type,
         cute::Underscore,
-        typename Parameters::mma,
+        typename Parameters::config::TiledMma,
         typename Parameters::gCopyA,
         typename Parameters::config::a_layout,
         typename Parameters::config::a_copy_op,
@@ -451,9 +449,9 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
 
     // Represent the full tensors
-    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs), cute::select<0,2>(shapeMNK), Parameters::strideA{}); // (M,K)
-    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights), cute::select<1,2>(shapeMNK), Parameters::strideB{}); // (N,K)
-    auto mC = cute::make_tensor(cute::make_gmem_ptr(result), cute::select<0,1>(shapeMNK), Parameters::strideC{}); // (M,N)
+    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs), cute::select<0,2>(shapeMNK), typename Parameters::strideA{}); // (M,K)
+    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights), cute::select<1,2>(shapeMNK), typename Parameters::strideB{}); // (N,K)
+    auto mC = cute::make_tensor(cute::make_gmem_ptr(result), cute::select<0,1>(shapeMNK), typename Parameters::strideC{}); // (M,N)
 
 
     // Get the appropriate blocks for this thread block
@@ -476,16 +474,16 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
         cute::Underscore{},
         threadIdx.x,
         buf);
-}
+}*/
 
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
     constexpr auto M = 128U;
     constexpr auto N = 128U;
     constexpr auto K = 8U;
-    using inputValueType = float;
-    using weightValueType = float;
-    using outValueType = float;
+    using inputValueType = cublasdx::tfloat32_t;
+    using weightValueType = cublasdx::tfloat32_t;
+    using outValueType = cublasdx::tfloat32_t;
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<M, N, K>()
                           + cublasdx::Precision<inputValueType>()
@@ -516,8 +514,8 @@ void testCollective() {
     }
     CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
     constexpr auto problemShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>{};
-    deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape, CAST_TO(inputValueType, abc),
-        CAST_TO(inputValueType, abc + GEMM::a_size), CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));
+    /*deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape, CAST_TO(inputValueType, abc),
+        CAST_TO(inputValueType, abc + GEMM::a_size), CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));*/
     free(data);
 }
 
@@ -545,6 +543,19 @@ void testAlloc() {
 }
 
 int main() {
-    print(idx2crd(3, cute::Shape<cute::_2, cute::_2>{}));
+    print(make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutLeft{}));
+    printf("\nReverse Above: ");
+    constexpr auto l = make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutLeft{});
+    print(reverse(l.shape<>()));
+    constexpr auto lp = make_layout(reverse(l.shape<>()), cute::LayoutLeft{});
+    printf("\n");
+    print(make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutRight{}));
+    printf("\n");
+    print(make_layout(cute::Shape<cute::Int<64>, cute::Int<128>>{}, cute::LayoutLeft{}));
+    printf("\n");
+    print(make_layout(cute::Shape<cute::Int<64>, cute::Int<128>>{}, cute::LayoutRight{}));
+    printf("\n");
+    printf("Primal \n");
+    print(lp);
     return 0;
 }

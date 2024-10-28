@@ -15,9 +15,9 @@
 #define THREADS 128U
 #define BLOCK_M 128U
 #define BLOCK_N 64U
-#define BLOCK_K_HALF 32U
-#define BLOCK_K_FULL 16U
-#define MAX_REGS 64U
+#define BLOCK_K_HALF 16U
+#define BLOCK_K_FULL 8U
+#define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
 
 template<unsigned int Arch, typename TC, typename TA=TC, typename TB=TA>
 struct MMAConfig {

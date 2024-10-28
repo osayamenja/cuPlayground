@@ -412,7 +412,7 @@ void testConfig() {
     cublasdx::size_of<GEMM>::m, cublasdx::size_of<GEMM>::n, cublasdx::size_of<GEMM>::k>;
 }
 
-/*template<class BlockMM, class ProblemShape>
+template<class BlockMM, class ProblemShape>
 requires (cublasdx::is_complete_blas<BlockMM>::value
 && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
 && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
@@ -427,24 +427,24 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
 
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<1>,
+        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<2>, // no pipeline
         blockTiler,
         typename BlockMM::a_value_type,
         cute::Underscore,
         typename BlockMM::b_value_type,
         cute::Underscore,
-        typename Parameters::config::TiledMma,
+        typename Parameters::mma_t,
         typename Parameters::gCopyA,
-        typename Parameters::config::a_layout,
-        typename Parameters::config::a_copy_op,
+        typename Parameters::sLayA,
+        typename Parameters::sCopyA,
         cute::identity,
         typename Parameters::gCopyB,
-        typename Parameters::config::b_layout,
-        typename Parameters::config::b_copy_op,
+        typename Parameters::sLayB,
+        typename Parameters::sCopyB,
         cute::identity
     >;
 
-    typename Parameters::config::TiledMma tiledMMA;
+    typename Parameters::mma_t tiledMMA;
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
 
@@ -455,7 +455,12 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
 
 
     // Get the appropriate blocks for this thread block
-    auto cta_coord = make_coord(blockIdx.x, blockIdx.y, cute::_);              // (m,n,k)
+    auto idxX = cute::is_static<decltype(unwrap(select<0>(shapeMNK)))>::value?
+        cute::Int<unwrap(select<0>(shapeMNK))>::value : unwrap(select<0>(shapeMNK));
+    auto idxY = cute::is_static<decltype(unwrap(select<1>(shapeMNK)))>::value?
+        cute::Int<unwrap(select<1>(shapeMNK))>::value : unwrap(select<1>(shapeMNK));
+    static_assert(cuda::std::is_integral_v<decltype(idxX)> && cuda::std::is_integral_v<decltype(idxY)>);
+    auto cta_coord = cute::idx2crd(blockIdx.x, cute::Shape(idxX, idxY));                            // (m,n,k)
     auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
     auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
@@ -474,13 +479,13 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
         cute::Underscore{},
         threadIdx.x,
         buf);
-}*/
+}
 
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
     constexpr auto M = 128U;
     constexpr auto N = 128U;
-    constexpr auto K = 8U;
+    constexpr auto K = 16U;
     using inputValueType = cublasdx::tfloat32_t;
     using weightValueType = cublasdx::tfloat32_t;
     using outValueType = cublasdx::tfloat32_t;
@@ -543,19 +548,12 @@ void testAlloc() {
 }
 
 int main() {
-    print(make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutLeft{}));
-    printf("\nReverse Above: ");
-    constexpr auto l = make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutLeft{});
-    print(reverse(l.shape<>()));
-    constexpr auto lp = make_layout(reverse(l.shape<>()), cute::LayoutLeft{});
-    printf("\n");
-    print(make_layout(cute::Shape<cute::Int<128>, cute::Int<64>>{}, cute::LayoutRight{}));
-    printf("\n");
-    print(make_layout(cute::Shape<cute::Int<64>, cute::Int<128>>{}, cute::LayoutLeft{}));
-    printf("\n");
-    print(make_layout(cute::Shape<cute::Int<64>, cute::Int<128>>{}, cute::LayoutRight{}));
-    printf("\n");
-    printf("Primal \n");
-    print(lp);
+    constexpr auto shapeMNK = make_shape(int{2}, cute::Int<2>{});
+    auto x = cute::is_static<decltype(unwrap(select<0>(shapeMNK)))>::value?
+        cute::Int<unwrap(select<0>(shapeMNK))>::value : unwrap(select<0>(shapeMNK));
+    auto y = cute::is_static<decltype(unwrap(select<1>(shapeMNK)))>::value?
+        cute::Int<unwrap(select<1>(shapeMNK))>::value : unwrap(select<1>(shapeMNK));
+    static_assert(cuda::std::is_integral_v<decltype(x)> && cuda::std::is_integral_v<decltype(y)>);
+    std::cout << idx2crd(2, cute::make_shape(x,y));
     return 0;
 }

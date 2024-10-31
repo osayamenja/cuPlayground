@@ -448,19 +448,32 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
 
-    // Represent the full tensors
-    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs), cute::select<0,2>(shapeMNK), typename Parameters::strideA{}); // (M,K)
-    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights), cute::select<1,2>(shapeMNK), typename Parameters::strideB{}); // (N,K)
-    auto mC = cute::make_tensor(cute::make_gmem_ptr(result), cute::select<0,1>(shapeMNK), typename Parameters::strideC{}); // (M,N)
+    /*auto aStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
+        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
+    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});
+    auto bStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
+        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
+    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});
+    auto cStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
+        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
+    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});*/
 
+    // Represent the full tensors
+    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs),
+        cute::make_layout(cute::select<0,2>(shapeMNK),
+            cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{}))); // (M,K)
+    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights),
+        cute::make_layout(cute::select<1,2>(shapeMNK),
+            cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)))); // (N,K)
+    auto mC = cute::make_tensor(cute::make_gmem_ptr(result),
+        cute::make_layout(cute::select<0,1>(shapeMNK),
+            cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)))); // (M,N)
 
     // Get the appropriate blocks for this thread block
-    auto idxX = cute::is_static<decltype(unwrap(select<0>(shapeMNK)))>::value?
-        cute::Int<unwrap(select<0>(shapeMNK))>::value : unwrap(select<0>(shapeMNK));
-    auto idxY = cute::is_static<decltype(unwrap(select<1>(shapeMNK)))>::value?
-        cute::Int<unwrap(select<1>(shapeMNK))>::value : unwrap(select<1>(shapeMNK));
-    static_assert(cuda::std::is_integral_v<decltype(idxX)> && cuda::std::is_integral_v<decltype(idxY)>);
-    auto cta_coord = cute::idx2crd(blockIdx.x, cute::Shape(idxX, idxY));                            // (m,n,k)
+    auto M = cute::get<0>(shapeMNK);
+    auto N = cute::get<1>(shapeMNK);
+    auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(M, N));
+    auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX),cute::get<1>(cta_coordX), cute::_);
     auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
     auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
@@ -483,12 +496,12 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
 
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
-    constexpr auto M = 128U;
-    constexpr auto N = 128U;
-    constexpr auto K = 16U;
+    constexpr auto M = 128;
+    constexpr auto N = 128;
+    constexpr auto K = 8;
     using inputValueType = cublasdx::tfloat32_t;
     using weightValueType = cublasdx::tfloat32_t;
-    using outValueType = cublasdx::tfloat32_t;
+    using outValueType = float;
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<M, N, K>()
                           + cublasdx::Precision<inputValueType>()
@@ -519,8 +532,10 @@ void testCollective() {
     }
     CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
     constexpr auto problemShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>{};
-    /*deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape, CAST_TO(inputValueType, abc),
-        CAST_TO(inputValueType, abc + GEMM::a_size), CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));*/
+    deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape,
+        CAST_TO(inputValueType, abc),
+        CAST_TO(inputValueType, abc + GEMM::a_size),
+        CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));
     free(data);
 }
 
@@ -548,12 +563,11 @@ void testAlloc() {
 }
 
 int main() {
-    constexpr auto shapeMNK = make_shape(int{2}, cute::Int<2>{});
-    auto x = cute::is_static<decltype(unwrap(select<0>(shapeMNK)))>::value?
-        cute::Int<unwrap(select<0>(shapeMNK))>::value : unwrap(select<0>(shapeMNK));
-    auto y = cute::is_static<decltype(unwrap(select<1>(shapeMNK)))>::value?
-        cute::Int<unwrap(select<1>(shapeMNK))>::value : unwrap(select<1>(shapeMNK));
-    static_assert(cuda::std::is_integral_v<decltype(x)> && cuda::std::is_integral_v<decltype(y)>);
-    std::cout << idx2crd(2, cute::make_shape(x,y));
+    auto t = cute::make_shape(4,5,6);
+    std::cout << t << std::endl;
+    auto x = cute::select<0,1>(t);
+    std::cout << x << std::endl;
+    auto l = cute::make_layout(x, cute::GenRowMajor{});
+    std::cout << l << std::endl;
     return 0;
 }

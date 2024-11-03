@@ -47,6 +47,7 @@ set_target_properties(cuPlayground PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
 )
 
+string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 #Link torch
 #target_precompile_headers(cuPlayground PRIVATE torchInclude.h)
 #target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
@@ -86,6 +87,9 @@ if(SPDLOG_ADDED)
     target_link_libraries(cuPlayground PRIVATE spdlog::spdlog)
 endif ()
 
+set(NvidiaCutlass_ROOT "$ENV{CUTLASS_PATH}")
+set(mathdx_CUTLASS_ROOT "$ENV{CUTLASS_PATH}")
+
 set(MATHDX_VER 24.08)
 set(MATHDX_URL_PREFIX "https://developer.download.nvidia.com/compute/cublasdx/redist/cublasdx")
 set(MATHDX_URL "${MATHDX_URL_PREFIX}/nvidia-mathdx-${MATHDX_VER}.0.tar.gz")
@@ -120,7 +124,6 @@ if(DEFINED ENV{LINK_GTL} AND DEFINED ENV{NERSC_HOST} AND "$ENV{NERSC_HOST}" STRE
     target_link_libraries(cuPlayground PRIVATE "${GTL}")
 endif ()
 
-string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
 target_compile_options(cuPlayground PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
         $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -v;--expt-relaxed-constexpr>

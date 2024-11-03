@@ -7,9 +7,13 @@
 #include <cuda/cmath>
 #include <cuda/std/array>
 #include <cuda/std/chrono>
+#include <cublasdx.hpp>
+#include <cuda/std/type_traits>
+#include <cute/arch/copy.hpp>
+#include <cute/arch/copy_sm80.hpp>
 #include <cutlass/epilogue/thread/activation.h>
-#include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/collective/collective_mma.hpp"
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/collective/collective_mma.hpp>
 #include <fmt/ranges.h>
 #include <cuda.h>
 #include <nccl.h>
@@ -412,14 +416,13 @@ void testConfig() {
     cublasdx::size_of<GEMM>::m, cublasdx::size_of<GEMM>::n, cublasdx::size_of<GEMM>::k>;
 }
 
-template<class BlockMM, class ProblemShape>
-requires (cublasdx::is_complete_blas<BlockMM>::value
-&& cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
-&& cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
-__global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
-    const typename BlockMM::a_value_type* __restrict__ inputs,
-    const typename BlockMM::b_value_type* __restrict__ weights,
-    typename BlockMM::c_value_type* __restrict__ result) {
+template<class BlockMM, typename MatrixA, typename MatrixB, typename MatrixC>
+requires (cute::is_tensor_v<MatrixA> && cute::is_tensor_v<MatrixB> && cute::is_tensor_v<MatrixC>
+    && cublasdx::is_complete_blas<BlockMM>::value
+    && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
+    && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
+__global__ void deviceCollectiveMMA(MatrixA mA, MatrixB mB, MatrixC mC) {
+    static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2);
     using Parameters = CollectiveMMAConfig<BlockMM>;
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
@@ -427,7 +430,7 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
 
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<2>, // no pipeline
+        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<Parameters::stages{}>,
         blockTiler,
         typename BlockMM::a_value_type,
         cute::Underscore,
@@ -448,32 +451,11 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
 
-    /*auto aStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
-        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
-    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});
-    auto bStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
-        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
-    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});
-    auto cStride = cublasdx::arrangement_of<BlockMM>::a == cublasdx::col_major ?
-        cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)) :
-    cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{});*/
-
-    // Represent the full tensors
-    auto mA = cute::make_tensor(cute::make_gmem_ptr(inputs),
-        cute::make_layout(cute::select<0,2>(shapeMNK),
-            cute::make_stride(cute::get<2>(shapeMNK), cute::Int<1>{}))); // (M,K)
-    auto mB = cute::make_tensor(cute::make_gmem_ptr(weights),
-        cute::make_layout(cute::select<1,2>(shapeMNK),
-            cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)))); // (N,K)
-    auto mC = cute::make_tensor(cute::make_gmem_ptr(result),
-        cute::make_layout(cute::select<0,1>(shapeMNK),
-            cute::make_stride(cute::Int<1>{}, cute::get<2>(shapeMNK)))); // (M,N)
-
     // Get the appropriate blocks for this thread block
-    auto M = cute::get<0>(shapeMNK);
-    auto N = cute::get<1>(shapeMNK);
+    auto M = cute::get<0>(mC.shape());
+    auto N = cute::get<1>(mC.shape());
     auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(M, N));
-    auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX),cute::get<1>(cta_coordX), cute::_);
+    auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
     auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
     auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
@@ -481,7 +463,7 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
-    extern __shared__ char* buf[];
+    extern __shared__ char buf[];
     CollectiveMainloop collective_mma;
     collective_mma(
         accum,
@@ -497,7 +479,7 @@ __global__ void deviceCollectiveMMA(ProblemShape shapeMNK,
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
     constexpr auto M = 128;
-    constexpr auto N = 128;
+    constexpr auto N = 64;
     constexpr auto K = 8;
     using inputValueType = cublasdx::tfloat32_t;
     using weightValueType = cublasdx::tfloat32_t;
@@ -531,11 +513,12 @@ void testCollective() {
         static_cast<weightValueType*>(data)[i] = static_cast<weightValueType>(j + 2);
     }
     CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
-    constexpr auto problemShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>{};
-    deviceCollectiveMMA<GEMM><<<1, 128>>>(problemShape,
-        CAST_TO(inputValueType, abc),
-        CAST_TO(inputValueType, abc + GEMM::a_size),
-        CAST_TO(inputValueType, abc + GEMM::a_size + GEMM::b_size));
+
+    auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+    auto mB = make_tensor(cute::make_gmem_ptr(CAST_TO(weightValueType, abc)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+    auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+
+    deviceCollectiveMMA<GEMM><<<1, 128>>>(mA, mB, mC);
     free(data);
 }
 
@@ -562,12 +545,49 @@ void testAlloc() {
     nvshmem_finalize();
 }
 
+void debugLayout() {
+    constexpr auto M = 128;
+    constexpr auto N = 128;
+    constexpr auto K = 8;
+    using inputValueType = cublasdx::tfloat32_t;
+    using weightValueType = cublasdx::tfloat32_t;
+    using outValueType = float;
+    // Has to be (M, K) * (N, K)
+    using GEMM = decltype(cublasdx::Size<M, N, K>()
+                          + cublasdx::Precision<inputValueType>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<800>()
+                          + cublasdx::Block());
+    constexpr auto bM = cublasdx::size_of<GEMM>::m;
+    constexpr auto bN = cublasdx::size_of<GEMM>::n;
+    constexpr auto bK = cublasdx::size_of<GEMM>::k;
+    using TileShape = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
+    using SmemLayoutAtomB = cute::Layout<cute::Shape<cute::_128, cute::_8>,
+    cute::Stride<cute::_1, cute::_128>>;
+    using tt = decltype(tile_to_shape(SmemLayoutAtomB{},
+      make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), cute::Int<2>{})));
+    using p = CollectiveMMAConfig<GEMM>;
+    using swz = SwizzleAtom<cublasdx::arrangement_of<GEMM>::a,
+    MiddleSwizzle<GEMM::a_value_type>{}, cublasdx::size_of<GEMM>::k>::swizzleAtom;
+    auto sw = composition(cute::Swizzle<3,2,3>{},
+                cute::Layout<cute::Shape < cute::_8,cute::_8>,
+                       cute::Stride<cute::_8, cute::_1>>{});
+
+    auto swizzle_atom = composition(cute::Swizzle<3,3,3>{},
+                                  cute::Layout<cute::Shape <cute::_8,cute::Shape <cute::_8, cute::_8>>,
+                                         cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{});
+    using tt2 = decltype(tile_to_shape(p::sLayA{},
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<2>{})));
+}
+
 int main() {
-    auto t = cute::make_shape(4,5,6);
-    std::cout << t << std::endl;
-    auto x = cute::select<0,1>(t);
-    std::cout << x << std::endl;
-    auto l = cute::make_layout(x, cute::GenRowMajor{});
-    std::cout << l << std::endl;
-    return 0;
+    constexpr cuda::std::array<float, 4> a {{0.6, 0.8, 0.9, 0.02}};
+    auto t = make_tensor(cute::make_gmem_ptr(a.data()), make_layout(cute::make_shape(2,2), cute::make_stride(2,1)));
+    static_assert(cuda::std::is_same_v<decltype(t)::value_type, float>);
+    print(t.stride()); printf("\n");
+    auto s = cute::get<0>(t.shape());
+    std::cout << s << std::endl;
+    print_tensor(t);
 }

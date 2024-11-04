@@ -41,6 +41,7 @@ do {                                                           \
 } while (0)
 #endif
 
+#define PIPELINE_STAGES 2
 constexpr unsigned int len = 10000U;
 template<unsigned int n>
 __device__ __forceinline__
@@ -430,7 +431,7 @@ __global__ void deviceCollectiveMMA(MatrixA mA, MatrixB mB, MatrixC mC) {
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
 
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<Parameters::stages{}>,
+        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>,
         blockTiler,
         typename BlockMM::a_value_type,
         cute::Underscore,
@@ -518,7 +519,7 @@ void testCollective() {
     auto mB = make_tensor(cute::make_gmem_ptr(CAST_TO(weightValueType, abc)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
     auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
 
-    deviceCollectiveMMA<GEMM><<<1, 128>>>(mA, mB, mC);
+    //deviceCollectiveMMA<GEMM><<<1, 128>>>(mA, mB, mC);
     free(data);
 }
 
@@ -582,12 +583,93 @@ void debugLayout() {
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<2>{})));
 }
 
+__device__ float matABC[18432];
+template<class GEMM>
+requires (cublasdx::is_complete_blas<GEMM>::value
+    && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
+    && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
+__global__ void testCopy() {
+    extern __shared__ float sBuf[];
+    using Parameters = CollectiveMMAConfig<GEMM>;
+    auto copyA = make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<typename GEMM::a_value_type>, typename GEMM::a_value_type>{},
+                                    cute::Layout<cute::Shape<cute::_16,cute::_8>,cute::Stride<cute::_8,cute::_1>>{},
+                                    cute::Layout<cute::Shape< cute::_1,cute::_1>>{});
+    auto copyB = make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<typename GEMM::b_value_type>, typename GEMM::b_value_type>{},
+                                    cute::Layout<cute::Shape<cute::_16,cute::_8>,cute::Stride<cute::_8,cute::_1>>{},
+                                    cute::Layout<cute::Shape< cute::_1,cute::_1>>{});
+    // auto gmem_thr_copy_A = Parameters::gCopyA::get_slice(threadIdx.x);
+    // auto gmem_thr_copy_B = Parameters::gCopyB::get_slice(threadIdx.x);
+
+    auto gmem_thr_copy_A = copyA.get_slice(threadIdx.x);
+    auto gmem_thr_copy_B = copyB.get_slice(threadIdx.x);
+
+    constexpr auto M = cublasdx::size_of<GEMM>::m;
+    constexpr auto N = cublasdx::size_of<GEMM>::n;
+    constexpr auto K = cublasdx::size_of<GEMM>::k;
+
+    auto mA = make_tensor(cute::make_gmem_ptr(matABC), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+    auto mB = make_tensor(cute::make_gmem_ptr(matABC + 1024), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+    auto mC = make_tensor(cute::make_gmem_ptr(matABC + 2048), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+
+    auto cta_coord = make_coord(0, 0, cute::_);
+    using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
+    auto gA = local_tile(mA, TileShape{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
+    auto gB = local_tile(mB, TileShape{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
+    auto gC = local_tile(mC, TileShape{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+
+    using SmemLayoutA = decltype(tile_to_shape(
+      typename Parameters::sLayA{},
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<PIPELINE_STAGES>{})));
+    using SmemLayoutB = decltype(tile_to_shape(
+        typename Parameters::sLayB{},
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), cute::Int<PIPELINE_STAGES>{})));
+
+    // using SmemLayoutA = decltype(make_layout(cute::make_shape(M, K, PIPELINE_STAGES), cute::LayoutRight{}));
+    // using SmemLayoutB = decltype(make_layout(cute::make_shape(N, K, PIPELINE_STAGES), cute::LayoutRight{}));
+    auto sA = make_tensor(cute::make_smem_ptr(sBuf), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
+    auto sB = make_tensor(cute::make_smem_ptr(sBuf + 1024), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+
+    auto tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
+    auto tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
+    auto tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
+    auto tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
+
+    auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
+    int k_tile_count = size<2>(gA);
+
+    if (cute::thread0()) {
+        print(cute::Copy_Atom<cute::SM75_U32x1_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
+        //print(cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
+        //print(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
+        print(cute::Copy_Atom<cute::SM75_U16x2_LDSM_T, cute::half_t>{});printf("\n");
+        print(cute::Copy_Atom<cute::SM75_U16x2_LDSM_T, cute::bfloat16_t>{});printf("\n");
+    }
+
+    auto mmaC = cute::TiledMMA<
+      cute::MMA_Atom<cute::SM80_16x8x8_F32F16F16F32_TN>,
+      cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
+      cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    >{};
+
+    auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U16x4_LDSM_T, cute::half_t>{}, mmaC);
+}
 int main() {
-    constexpr cuda::std::array<float, 4> a {{0.6, 0.8, 0.9, 0.02}};
-    auto t = make_tensor(cute::make_gmem_ptr(a.data()), make_layout(cute::make_shape(2,2), cute::make_stride(2,1)));
-    static_assert(cuda::std::is_same_v<decltype(t)::value_type, float>);
-    print(t.stride()); printf("\n");
-    auto s = cute::get<0>(t.shape());
-    std::cout << s << std::endl;
-    print_tensor(t);
+    constexpr auto M = 128;
+    constexpr auto N = 128;
+    constexpr auto K = 8;
+    using inputValueType = float;
+    using weightValueType = float;
+    using outValueType = float;
+    // Has to be (M, K) * (N, K)
+    using GEMM = decltype(cublasdx::Size<M, N, K>()
+                          + cublasdx::Precision<inputValueType>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<800>()
+                          + cublasdx::Block());
+    using Parameters = CollectiveMMAConfig<GEMM>;
+
+    testCopy<GEMM><<<1,THREADS>>>();
+    CUTE_CHECK_LAST();
 }

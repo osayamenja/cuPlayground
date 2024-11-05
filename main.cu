@@ -487,15 +487,16 @@ void testCollective() {
     using outValueType = float;
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<M, N, K>()
-                          + cublasdx::Precision<inputValueType>()
+                          + cublasdx::Precision<inputValueType, weightValueType, outValueType>()
                           + cublasdx::Type<cublasdx::type::real>()
-                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
 
-    constexpr auto abcSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
-    + (sizeof(GEMM::b_value_type) * GEMM::b_size) + (sizeof(GEMM::b_value_type) * GEMM::c_size);
+    constexpr auto sharedSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
+    + (sizeof(GEMM::b_value_type) * GEMM::b_size);
+    constexpr auto abcSize = sharedSize + (sizeof(GEMM::b_value_type) * GEMM::c_size);
     cuda::std::byte* abc;
     CUTE_CHECK_ERROR(cudaMallocAsync(&abc, abcSize, playStream));
 
@@ -506,12 +507,12 @@ void testCollective() {
     auto* data = malloc(abcSize);
 #pragma unroll
     for (;i < GEMM::a_size; ++i) {
-        static_cast<inputValueType*>(data)[i] = static_cast<inputValueType>(i);
+        static_cast<inputValueType*>(data)[i] = static_cast<inputValueType>(0.01);
     }
 
 #pragma unroll
     for (int j = 0; i < GEMM::a_size + GEMM::b_size; ++i, ++j) {
-        static_cast<weightValueType*>(data)[i] = static_cast<weightValueType>(j + 2);
+        static_cast<weightValueType*>(data)[i] = static_cast<weightValueType>(0.02);
     }
     CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
 
@@ -519,7 +520,7 @@ void testCollective() {
     auto mB = make_tensor(cute::make_gmem_ptr(CAST_TO(weightValueType, abc)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
     auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
 
-    //deviceCollectiveMMA<GEMM><<<1, 128>>>(mA, mB, mC);
+    deviceCollectiveMMA<GEMM><<<1, 128, sharedSize, playStream>>>(mA, mB, mC);
     free(data);
 }
 
@@ -557,7 +558,7 @@ void debugLayout() {
     using GEMM = decltype(cublasdx::Size<M, N, K>()
                           + cublasdx::Precision<inputValueType>()
                           + cublasdx::Type<cublasdx::type::real>()
-                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
@@ -583,22 +584,16 @@ void debugLayout() {
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<2>{})));
 }
 
-__device__ float matABC[18432];
+__device__ cute::tfloat32_t matABC[11264];
 template<class GEMM>
 requires (cublasdx::is_complete_blas<GEMM>::value
     && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
     && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
 __global__ void testCopy() {
-    extern __shared__ float sBuf[];
+    __shared__ cute::tfloat32_t sBuf[3072];
     using Parameters = CollectiveMMAConfig<GEMM>;
-    auto copyA = make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<typename GEMM::a_value_type>, typename GEMM::a_value_type>{},
-                                    cute::Layout<cute::Shape<cute::_16,cute::_8>,cute::Stride<cute::_8,cute::_1>>{},
-                                    cute::Layout<cute::Shape< cute::_1,cute::_1>>{});
-    auto copyB = make_tiled_copy(cute::Copy_Atom<cute::SM80_CP_ASYNC_CACHEALWAYS<typename GEMM::b_value_type>, typename GEMM::b_value_type>{},
-                                    cute::Layout<cute::Shape<cute::_16,cute::_8>,cute::Stride<cute::_8,cute::_1>>{},
-                                    cute::Layout<cute::Shape< cute::_1,cute::_1>>{});
-    // auto gmem_thr_copy_A = Parameters::gCopyA::get_slice(threadIdx.x);
-    // auto gmem_thr_copy_B = Parameters::gCopyB::get_slice(threadIdx.x);
+    auto copyA = typename Parameters::gCopyA{};
+    auto copyB = typename Parameters::gCopyB{};
 
     auto gmem_thr_copy_A = copyA.get_slice(threadIdx.x);
     auto gmem_thr_copy_B = copyB.get_slice(threadIdx.x);
@@ -609,7 +604,7 @@ __global__ void testCopy() {
 
     auto mA = make_tensor(cute::make_gmem_ptr(matABC), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
     auto mB = make_tensor(cute::make_gmem_ptr(matABC + 1024), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
-    auto mC = make_tensor(cute::make_gmem_ptr(matABC + 2048), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+    auto mC = make_tensor(cute::make_gmem_ptr(matABC + 1536), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
 
     auto cta_coord = make_coord(0, 0, cute::_);
     using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
@@ -619,15 +614,13 @@ __global__ void testCopy() {
 
     using SmemLayoutA = decltype(tile_to_shape(
       typename Parameters::sLayA{},
-      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<PIPELINE_STAGES>{})));
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), PIPELINE_STAGES)));
     using SmemLayoutB = decltype(tile_to_shape(
         typename Parameters::sLayB{},
-        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), cute::Int<PIPELINE_STAGES>{})));
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), PIPELINE_STAGES)));
 
-    // using SmemLayoutA = decltype(make_layout(cute::make_shape(M, K, PIPELINE_STAGES), cute::LayoutRight{}));
-    // using SmemLayoutB = decltype(make_layout(cute::make_shape(N, K, PIPELINE_STAGES), cute::LayoutRight{}));
     auto sA = make_tensor(cute::make_smem_ptr(sBuf), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
-    auto sB = make_tensor(cute::make_smem_ptr(sBuf + 1024), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
+    auto sB = make_tensor(cute::make_smem_ptr(sBuf + 2048), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
 
     auto tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     auto tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
@@ -637,34 +630,64 @@ __global__ void testCopy() {
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
-    if (cute::thread0()) {
-        print(cute::Copy_Atom<cute::SM75_U32x1_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
-        //print(cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
-        //print(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{});printf("\n");
-        print(cute::Copy_Atom<cute::SM75_U16x2_LDSM_T, cute::half_t>{});printf("\n");
-        print(cute::Copy_Atom<cute::SM75_U16x2_LDSM_T, cute::bfloat16_t>{});printf("\n");
-    }
-
-    auto mmaC = cute::TiledMMA<
-      cute::MMA_Atom<cute::SM80_16x8x8_F32F16F16F32_TN>,
+    auto tiled_mma = cute::TiledMMA<
+      cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>,
       cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-      cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >{};
 
-    auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U16x4_LDSM_T, cute::half_t>{}, mmaC);
+    static_assert(cuda::std::is_same_v<decltype(tiled_mma), typename Parameters::mma_t>);
+
+    auto smem_tiled_copy_A = make_tiled_copy_A(typename Parameters::sCopyA{}, tiled_mma);
+    //auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
+   auto smem_tiled_copy_B = make_tiled_copy_B(typename Parameters::sCopyB{}, tiled_mma);
+    //auto smem_tiled_copy_B = make_tiled_copy_B(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
+
+    auto tCsA = smem_thr_copy_A.partition_S(sA);
+    auto tCsB = smem_thr_copy_B.partition_S(sB);
+
+    auto tCsA_p = tCsA(cute::_,cute::_,cute::_,0);
+    auto tCsB_p = tCsB(cute::_,cute::_,cute::_,0);
+    auto thr_mma = tiled_mma.get_thread_slice(threadIdx.x);
+
+    auto tCrB = thr_mma.partition_fragment_B(sB(cute::_,cute::_,0));
+    auto tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+
+    auto tCrA = thr_mma.partition_fragment_A(sA(cute::_,cute::_,0));
+    auto tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);
+
+    if (cute::thread0()) {
+        print(tCrA); printf("\n");
+        print(size(tCrA)); printf("\n");
+        print(tCrA_copy_view); printf("\n");
+        print(size(tCrA_copy_view(cute::_, cute::_, 0))); printf("\n");
+        print(tCsA_p); printf("\n");
+        print(size(tCsA_p(cute::_, cute::_, 0) )); printf("\n");
+        printf("-------------------------------------\n");
+        print(tCrB); printf("\n");
+        print(size(tCrB)); printf("\n");
+        print(tCrB_copy_view); printf("\n");
+        print(size(tCrB_copy_view(cute::_, cute::_, 0))); printf("\n");
+        print(tCsB_p); printf("\n");
+        print(size(tCsB_p(cute::_, cute::_, 0) )); printf("\n");
+    }
+    copy(smem_tiled_copy_A, tCsA_p(cute::_,cute::_,0), tCrA_copy_view(cute::_,cute::_,0));
+    copy(smem_tiled_copy_B, tCsB_p(cute::_,cute::_,0), tCrB_copy_view(cute::_,cute::_,0));
 }
 int main() {
     constexpr auto M = 128;
-    constexpr auto N = 128;
+    constexpr auto N = 64;
     constexpr auto K = 8;
-    using inputValueType = float;
-    using weightValueType = float;
+    using inputValueType = cublasdx::tfloat32_t;
+    using weightValueType = cublasdx::tfloat32_t;
     using outValueType = float;
     // Has to be (M, K) * (N, K)
     using GEMM = decltype(cublasdx::Size<M, N, K>()
-                          + cublasdx::Precision<inputValueType>()
+                          + cublasdx::Precision<inputValueType, weightValueType, outValueType>()
                           + cublasdx::Type<cublasdx::type::real>()
-                          + cublasdx::Arrangement<cublasdx::row_major>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());

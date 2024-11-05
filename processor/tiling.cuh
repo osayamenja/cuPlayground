@@ -25,7 +25,7 @@ struct MMAConfig {
     using mma = cute::TiledMMA<
                 cute::MMA_Atom<cute::UniversalFMA<TC, TA, TB>>,
                 cute::Layout<cute::Shape<cute::_16, cute::_8, cute::_1>>,
-                cute::Tile<cute::_32, cute::_32, cute::Underscore>
+                cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -34,7 +34,7 @@ struct MMAConfig<700, cute::half_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM70_8x8x4_F16F16F16F16_TN>,
       cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -43,7 +43,7 @@ struct MMAConfig<700, float, cute::half_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM70_8x8x4_F32F16F16F32_TN>,
       cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -52,7 +52,7 @@ struct MMAConfig<800, cute::half_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM80_16x8x8_F16F16F16F16_TN>,
       cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -61,7 +61,7 @@ struct MMAConfig<800, float, cute::half_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM80_16x8x8_F32F16F16F32_TN>,
       cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -70,7 +70,7 @@ struct MMAConfig<800, float, cute::bfloat16_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM80_16x8x8_F32BF16BF16F32_TN>,
       cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -79,7 +79,7 @@ struct MMAConfig<800, float, cute::tfloat32_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>,
       cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::Underscore>
+    cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
 
@@ -131,7 +131,6 @@ struct SwizzleAtom<cublasdx::arrangement::row_major, 3, BLOCK_K_FULL> {
 
 template<>
 struct SwizzleAtom<cublasdx::arrangement::col_major, 3, BLOCK_K_FULL> {
-    // Weird combination but such is life
     using swizzleAtom =  decltype(
     composition(cute::Swizzle<3,3,3>{},
                 cute::Layout<cute::Shape <cute::_8, cute::_8>,
@@ -167,13 +166,13 @@ template<
     typename ElementB,
     unsigned int Arch,
     cublasdx::arrangement a = cublasdx::arrangement::row_major, // T
-    cublasdx::arrangement b = cublasdx::arrangement::col_major  // N
+    cublasdx::arrangement b = cublasdx::arrangement::row_major  // N
 >
 struct CopyOp {
     static_assert((a == cublasdx::arrangement::row_major &&
-        b == cublasdx::arrangement::col_major )||
+        b == cublasdx::arrangement::row_major )||
         (a == cublasdx::arrangement::col_major &&
-            b == cublasdx::arrangement::row_major));
+            b == cublasdx::arrangement::col_major));
 
     using copyAT = decltype(cute::make_tiled_copy(
         cute::Copy_Atom<copyArch<ElementA, Arch>, ElementA>{},
@@ -198,9 +197,9 @@ struct CopyOp {
         cute::Layout<cute::Shape<cute::_1, cute::_1>>{}));
 
     using copyA = cuda::std::conditional_t<(a == cublasdx::arrangement::row_major &&
-        b == cublasdx::arrangement::col_major), copyAT, copyAN>;
+        b == cublasdx::arrangement::row_major), copyAT, copyAN>;
     using copyB = cuda::std::conditional_t<(a == cublasdx::arrangement::row_major &&
-        b == cublasdx::arrangement::col_major), copyBN, copyBT>;
+        b == cublasdx::arrangement::row_major), copyBN, copyBT>;
 };
 
 enum class LayoutOptimization {

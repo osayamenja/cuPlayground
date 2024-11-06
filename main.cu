@@ -1,5 +1,7 @@
 #include <iostream>
 
+#include <typeinfo>
+#include <cxxabi.h>
 #include <boost/random/uniform_int_distribution.hpp>
 #include <boost/random/mersenne_twister.hpp>
 
@@ -411,9 +413,12 @@ void testConfig() {
                           + cublasdx::Block());
 
     using config = cublasdx::detail::layout_database::optimal_config<THREADS, cublasdx::sm_of<GEMM>::value,
-    typename GEMM::a_value_type, cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::a,
-    typename GEMM::b_value_type, cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::b,
-    typename GEMM::c_value_type, cublasdx::arrangement_of<GEMM>::c == cublasdx::arrangement::col_major, cublasdx::alignment_of<GEMM>::c,
+    typename GEMM::a_value_type, cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::col_major,
+    cublasdx::alignment_of<GEMM>::a,
+    typename GEMM::b_value_type, cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::col_major,
+    cublasdx::alignment_of<GEMM>::b,
+    typename GEMM::c_value_type, cublasdx::arrangement_of<GEMM>::c == cublasdx::arrangement::col_major,
+    cublasdx::alignment_of<GEMM>::c,
     cublasdx::size_of<GEMM>::m, cublasdx::size_of<GEMM>::n, cublasdx::size_of<GEMM>::k>;
 }
 
@@ -451,11 +456,13 @@ __global__ void deviceCollectiveMMA(MatrixA mA, MatrixB mB, MatrixC mC) {
     typename Parameters::mma_t tiledMMA;
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
+    cute::clear(accum);
 
     // Get the appropriate blocks for this thread block
+    // use problem shape instead, p_MNK = (cute::ceil_div(M, bM), cute::ceil_div(N, bN), K)
     auto M = cute::get<0>(mC.shape());
     auto N = cute::get<1>(mC.shape());
-    auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(M, N));
+    auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(cute::ceil_div(M, bM), cute::ceil_div(N, bN)));
     auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
     auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
@@ -475,6 +482,17 @@ __global__ void deviceCollectiveMMA(MatrixA mA, MatrixB mB, MatrixC mC) {
         cute::Underscore{},
         threadIdx.x,
         buf);
+
+    auto tDgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
+    cute::copy(accum, tDgC);
+#if 1
+    __syncthreads();
+    if (cute::thread0()) {
+        cute::print_tensor(mA);
+        cute::print_tensor(mB);
+        cute::print_tensor(mC);
+    }
+#endif
 }
 
 void testCollective() {
@@ -494,33 +512,41 @@ void testCollective() {
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
 
-    constexpr auto sharedSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
+    constexpr auto abSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
     + (sizeof(GEMM::b_value_type) * GEMM::b_size);
-    constexpr auto abcSize = sharedSize + (sizeof(GEMM::b_value_type) * GEMM::c_size);
+    constexpr auto abcSize = abSize + (sizeof(GEMM::c_value_type) * GEMM::c_size);
     cuda::std::byte* abc;
     CUTE_CHECK_ERROR(cudaMallocAsync(&abc, abcSize, playStream));
-
-    int i = 0;
-    static_assert(sizeof(inputValueType) == sizeof(weightValueType));
-    static_assert(sizeof(inputValueType) == sizeof(outValueType));
-    static_assert(sizeof(weightValueType) == sizeof(outValueType));
+    CUTE_CHECK_ERROR(cudaMemsetAsync(abc, 0, abcSize, playStream));
     auto* data = malloc(abcSize);
-#pragma unroll
-    for (;i < GEMM::a_size; ++i) {
-        static_cast<inputValueType*>(data)[i] = static_cast<inputValueType>(0.01);
-    }
 
-#pragma unroll
-    for (int j = 0; i < GEMM::a_size + GEMM::b_size; ++i, ++j) {
-        static_cast<weightValueType*>(data)[i] = static_cast<weightValueType>(0.02);
-    }
-    CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abcSize, cudaMemcpyHostToDevice, playStream));
+    auto mAHost = make_tensor(CAST_TO(inputValueType, data),
+        make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+    auto mBHost = make_tensor(CAST_TO(weightValueType, data + (sizeof(GEMM::a_value_type) * GEMM::a_size)),
+        make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
 
-    auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
-    auto mB = make_tensor(cute::make_gmem_ptr(CAST_TO(weightValueType, abc)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
-    auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+    mAHost(0, 0) = static_cast<inputValueType>(0.0);
+    mAHost(0, 1) = static_cast<inputValueType>(1.0);
+    mAHost(1, 0) = static_cast<inputValueType>(2.0);
+    mAHost(1, 1) = static_cast<inputValueType>(3.0);
 
-    deviceCollectiveMMA<GEMM><<<1, 128, sharedSize, playStream>>>(mA, mB, mC);
+    mBHost(0, 0) = static_cast<weightValueType>(4.0);
+    mBHost(0, 1) = static_cast<weightValueType>(5.0);
+    mBHost(1, 0) = static_cast<weightValueType>(6.0);
+    mBHost(1, 1) = static_cast<weightValueType>(7.0);
+
+    CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, abSize, cudaMemcpyHostToDevice, playStream));
+
+    auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)),
+        make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+    auto mB = make_tensor(cute::make_gmem_ptr(
+        CAST_TO(weightValueType, abc + (sizeof(GEMM::a_value_type) * GEMM::a_size))),
+        make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+    auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc + abSize)),
+        make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+
+    deviceCollectiveMMA<GEMM><<<1, 128, abSize * PIPELINE_STAGES, playStream>>>(mA, mB, mC);
+    CUTE_CHECK_LAST();
     free(data);
 }
 
@@ -589,8 +615,17 @@ template<class GEMM>
 requires (cublasdx::is_complete_blas<GEMM>::value
     && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
     && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
-__global__ void testCopy() {
+__global__ void testSharedCopy() {
     __shared__ cute::tfloat32_t sBuf[3072];
+    if (cute::thread0()) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            sBuf[i] = cute::tfloat32_t(0.01);
+            sBuf[2048 + i] = cute::tfloat32_t(0.03);
+        }
+    }
+    __threadfence_block();
+    __syncthreads();
     using Parameters = CollectiveMMAConfig<GEMM>;
     auto copyA = typename Parameters::gCopyA{};
     auto copyB = typename Parameters::gCopyB{};
@@ -622,6 +657,10 @@ __global__ void testCopy() {
     auto sA = make_tensor(cute::make_smem_ptr(sBuf), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     auto sB = make_tensor(cute::make_smem_ptr(sBuf + 2048), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
 
+    if (cute::thread0()) {
+        print_tensor(sA);
+    }
+
     auto tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     auto tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     auto tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
@@ -638,11 +677,11 @@ __global__ void testCopy() {
 
     static_assert(cuda::std::is_same_v<decltype(tiled_mma), typename Parameters::mma_t>);
 
-    auto smem_tiled_copy_A = make_tiled_copy_A(typename Parameters::sCopyA{}, tiled_mma);
-    //auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+    //auto smem_tiled_copy_A = make_tiled_copy_A(typename Parameters::sCopyA{}, tiled_mma);
+    auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
     auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
-   auto smem_tiled_copy_B = make_tiled_copy_B(typename Parameters::sCopyB{}, tiled_mma);
-    //auto smem_tiled_copy_B = make_tiled_copy_B(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+    //auto smem_tiled_copy_B = make_tiled_copy_B(typename Parameters::sCopyB{}, tiled_mma);
+    auto smem_tiled_copy_B = make_tiled_copy_B(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
     auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
 
     auto tCsA = smem_thr_copy_A.partition_S(sA);
@@ -673,10 +712,98 @@ __global__ void testCopy() {
         print(tCsB_p); printf("\n");
         print(size(tCsB_p(cute::_, cute::_, 0) )); printf("\n");
     }
+    if (cute::thread0()) {
+        cute::print_tensor(tCsA_p(cute::_,cute::_,0));
+        cute::print_tensor(tCrA);
+        printf("-------------------------------------\n");
+    }
     copy(smem_tiled_copy_A, tCsA_p(cute::_,cute::_,0), tCrA_copy_view(cute::_,cute::_,0));
     copy(smem_tiled_copy_B, tCsB_p(cute::_,cute::_,0), tCrB_copy_view(cute::_,cute::_,0));
+
+    if (cute::thread0()) {
+        cute::print_tensor(tCsA_p(cute::_,cute::_,0));
+        cute::print_tensor(tCrA);
+    }
 }
-int main() {
+
+template<class GEMM>
+requires (cublasdx::is_complete_blas<GEMM>::value
+    && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
+    && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
+__global__ void testGCopy() {
+    __shared__ cute::tfloat32_t sBuf[3072];
+    if (cute::thread0()) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            sBuf[i] = cute::tfloat32_t(0.01);
+            sBuf[2048 + i] = cute::tfloat32_t(0.03);
+        }
+    }
+    __threadfence_block();
+    __syncthreads();
+    using Parameters = CollectiveMMAConfig<GEMM>;
+    auto copyA = typename Parameters::gCopyA{};
+    auto copyB = typename Parameters::gCopyB{};
+
+    auto gmem_thr_copy_A = copyA.get_slice(threadIdx.x);
+    auto gmem_thr_copy_B = copyB.get_slice(threadIdx.x);
+
+    constexpr auto M = cublasdx::size_of<GEMM>::m;
+    constexpr auto N = cublasdx::size_of<GEMM>::n;
+    constexpr auto K = cublasdx::size_of<GEMM>::k;
+
+    auto mA = make_tensor(cute::make_gmem_ptr(matABC), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+    auto mB = make_tensor(cute::make_gmem_ptr(matABC + 1024), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+    auto mC = make_tensor(cute::make_gmem_ptr(matABC + 1536), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
+
+    auto cta_coord = make_coord(0, 0, cute::_);
+    using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
+    auto gA = local_tile(mA, TileShape{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});
+    auto gB = local_tile(mB, TileShape{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});
+    auto gC = local_tile(mC, TileShape{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});
+
+    using SmemLayoutA = decltype(tile_to_shape(
+      typename Parameters::sLayA{},
+      make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), PIPELINE_STAGES)));
+    using SmemLayoutB = decltype(tile_to_shape(
+        typename Parameters::sLayB{},
+        make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), PIPELINE_STAGES)));
+
+    auto sA = make_tensor(cute::make_smem_ptr(sBuf), SmemLayoutA{});
+    auto sB = make_tensor(cute::make_smem_ptr(sBuf + 2048), SmemLayoutB{});
+
+    if (cute::thread0()) {
+        print_tensor(sA);
+    }
+
+    auto tAgA = gmem_thr_copy_A.partition_S(gA);
+    auto tAsA = gmem_thr_copy_A.partition_D(sA);
+    auto tBgB = gmem_thr_copy_B.partition_S(gB);
+    auto tBsB = gmem_thr_copy_B.partition_D(sB);
+
+    copy(copyB, tBgB(cute::_,cute::_,cute::_,0), tBsB(cute::_,cute::_,cute::_,0));
+}
+
+template<typename T>
+void printType() {
+    // Get the mangled name
+    const char* mangledName = typeid(T).name();
+
+    // Demangle the name
+    int status;
+    char* demangledName = abi::__cxa_demangle(mangledName, nullptr, nullptr, &status);
+
+    // Print the demangled name
+    if (status == 0) {
+        std::cout << "Demangled name: " << demangledName << std::endl;
+    } else {
+        std::cerr << "Demangling failed!" << std::endl;
+    }
+    // Free the memory allocated by abi::__cxa_demangle
+    free(demangledName);
+}
+
+void golfing() {
     constexpr auto M = 128;
     constexpr auto N = 64;
     constexpr auto K = 8;
@@ -693,6 +820,20 @@ int main() {
                           + cublasdx::Block());
     using Parameters = CollectiveMMAConfig<GEMM>;
 
-    testCopy<GEMM><<<1,THREADS>>>();
+    testGCopy<GEMM><<<1,1>>>();
     CUTE_CHECK_LAST();
+}
+
+int main() {
+    testCollective();
+    //golfing();
+    // constexpr auto bM = 128;
+    // constexpr auto bN = 64;
+    // constexpr auto bK = 8;
+    //
+    // constexpr auto M = 128;
+    // constexpr auto N = 128;
+    // constexpr auto K = 8;
+    // constexpr auto i = idx2crd(0, cute::Shape<cute::_1, cute::_1>{});
+    // std::cout << i << std::endl;
 }

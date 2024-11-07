@@ -12,7 +12,7 @@
 
 // GEMM configuration constants
 #define MIN_ARCH 700
-#define THREADS 128
+#define THREADS 128U
 #define BLOCK_M 128
 #define BLOCK_M_EXP 64
 #define BLOCK_N 64

@@ -46,7 +46,6 @@ do {                                                           \
 } while (0)
 #endif
 
-#define PIPELINE_STAGES 2
 constexpr unsigned int len = 10U;
 template<unsigned int n>
 __device__ __forceinline__
@@ -434,6 +433,13 @@ requires(cuda::std::is_same_v<Element, cute::half_t> ||
     cuda::std::is_same_v<Element, cute::float_e5m2_t>)
 CUTE_DEVICE
 auto fusedAddActivate(Element& accumulator, const Element& term, const ActivationFunction& op) {
+    if constexpr (sizeof(Element) >= 4) {
+        return op(fma(Element(1.0f), accumulator, term));
+    }
+    if constexpr(sizeof(Element) == 2) {
+        // Half precision FMA
+        return op(__hfma(Element(1.0f), accumulator, term));
+    }
     return op(accumulator + term);
 }
 
@@ -455,6 +461,7 @@ auto fusedAddActivate(cute::bfloat16_t& accumulator, const cute::bfloat16_t& ter
     return cute::bfloat16_t(__hfma_relu(__nv_bfloat16(1.0f),
         accumulator.to_nv_bfloat16(), term.to_nv_bfloat16()));
 }
+
 
 void __global__ benchFAA() {
     auto val = 0.5_hf;
@@ -485,7 +492,10 @@ __device__ unsigned int syncP = 0;
 // <=96 registers: <= 5 blocks
 template<class BlockMM, typename ActivationOp = cute::identity, unsigned int sharedSize,
 typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD,
-typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx>
+typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx,
+typename ElementA = typename MatrixAx::value_type,
+typename ElementB = typename MatrixBx::value_type,
+typename ElementC = typename MatrixCx::value_type>
 requires (cute::is_tensor_v<MatrixA>
     && cute::is_tensor_v<MatrixB>
     && cute::is_tensor_v<MatrixC>
@@ -505,7 +515,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     const MatrixAx mAx, const MatrixBx mBx, MatrixCx mCx, const MatrixDx mDx) {
     static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
     static_assert(rank(mAx) == 2 && rank(mBx) == 2 && rank(mCx) == 2 && rank(mDx) == 2);
-    using Parameters = CollectiveMMAConfig<BlockMM>;
+    using Parameters = CollectiveMMAConfig<BlockMM, ElementA, ElementB, ElementC, LayoutOptimization::UseSwizzle>;
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
     constexpr auto bK = cublasdx::size_of<BlockMM>::k;
@@ -515,11 +525,11 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
 
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>,
+        typename Parameters::dispatch,
         blockTiler,
-        typename BlockMM::a_value_type,
+        ElementA,
         cute::Underscore,
-        typename BlockMM::b_value_type,
+        ElementB,
         cute::Underscore,
         typename Parameters::mma_t,
         typename Parameters::gCopyA,
@@ -552,7 +562,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
-    extern __shared__ typename BlockMM::c_value_type scratch[];
+    extern __shared__ ElementC scratch[];
     CollectiveMainloop collective_mma;
     collective_mma(
         accum,
@@ -569,17 +579,18 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     // Epilogue
     auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
+    auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
+
     // Accounts for GEMMs that accumulate in types differing from input types,
     // given that the result moonlights as the input for the succeeding GEMM.
     auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, typename decltype(accum)::value_type>{};
-
-    auto tD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
+    auto gDLoadOp = cutlass::NumericConverter<typename decltype(accum)::value_type, typename decltype(tDgD)::value_type>{};
 
     // Assume unary operator
     ActivationOp epilogueOp{};
-    constexpr auto elemsBytes = (sharedSize / THREADS);
-    constexpr auto trips = (size(accum) * sizeof(BlockMM::c_value_type)) / elemsBytes;
-    constexpr auto elems = elemsBytes / sizeof(BlockMM::c_value_type);
+    constexpr auto elemsBytes = sharedSize / THREADS;
+    constexpr auto trips = size(accum) * sizeof(ElementC) / elemsBytes;
+    constexpr auto elems = elemsBytes / sizeof(ElementC);
     // Instead of shared memory, we could use 32 registers per trip, for the workspace instead.
     // We would be within the budget (32 + 64 <= 100) and, as a bonus, bypass the above barrier as well.
     // However, then we would be at the mercy of the compiler,
@@ -592,28 +603,21 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         // Use addressing that minimizes bank conflicts in shared memory
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            scratch[threadIdx.x + j * THREADS] = tD(j + i * elems);
+            scratch[threadIdx.x + j * THREADS] = gDLoadOp(tDgD(j + i * elems));
         }
         // Fused Bias Add and Activation Function on register fragment
-        // Also fuses copy to GMEM,
-        // here's to believing these global memory stores are non-blocking.
-        // I am considering fusing the accumulator clear to the below loop.
-        // However, I am hesitant to do so due to the distinct possibility that
-        // setting the dependent register to zero somehow
-        // interferes with or invalidates the non-blocking execution of the global memory store.
-        // Most likely, this is not a problem.
-
+        // Also fuses copy to GMEM
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
             tCgC(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
                 scratch[threadIdx.x + j * THREADS], epilogueOp));
         }
     }
-    //cute::copy(accum, tCgC);
+
     __threadfence(); // Ensures writes are visible device-wide
     __syncthreads();
 
-#if 1
+#if 0
     if (cute::thread0()) {
         cute::print_tensor(mD);
         cute::print_tensor(mA);
@@ -655,7 +659,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     __syncthreads();
 
     // Epilogue
-    tD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
+    tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
     auto tCgCx = tiledMMA.get_slice(threadIdx.x).partition_C(gCx);
 
     CUTE_UNROLL
@@ -663,19 +667,19 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         // Prefetch
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            scratch[threadIdx.x + j * THREADS] = tD(j + i * elems);
+            scratch[threadIdx.x + j * THREADS] = gDLoadOp(tDgD(j + i * elems));
         }
         // Fused Bias Add on register fragment
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            tCgCx(j + i * elems) = accum(j + i * elems) + scratch[threadIdx.x + j * THREADS];
+            tCgCx(j + i * elems) = gCStoreOp(accum(j + i * elems) + scratch[threadIdx.x + j * THREADS]);
         }
     }
     __threadfence(); // Ensures writes are visible device-wide
     __syncthreads();
 #endif
     // Signal publisher
-#if 1
+#if 0
     if (cute::thread0()) {
         cute::print_tensor(mAx);
         cute::print_tensor(mBx);
@@ -684,6 +688,16 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     }
 #endif
 }
+
+template<typename T>
+using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
+        __half,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::bfloat16_t>,
+        __nv_bfloat16,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e4m3_t>,
+        __nv_fp8_e4m3,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e5m2_t>,
+        __nv_fp8_e5m2, T>>>>;
 
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
@@ -694,12 +708,13 @@ void testCollective() {
     constexpr auto bM = 128;
     constexpr auto bN = 64;
     constexpr auto bK = 8;
-    using inputValueType = cublasdx::tfloat32_t;
-    using weightValueType = cublasdx::tfloat32_t;
+    using inputValueType = cute::half_t;
+    using weightValueType = cute::half_t;
     using outValueType = float;
+
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<bM, bN, bK>()
-                          + cublasdx::Precision<inputValueType, weightValueType, outValueType>()
+                          + cublasdx::Precision<toCDX<inputValueType>, toCDX<weightValueType>, outValueType>()
                           + cublasdx::Type<cublasdx::type::real>()
                           + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
@@ -707,10 +722,10 @@ void testCollective() {
                           + cublasdx::Block()
                           + cublasdx::BlockDim<128>());
 
-    constexpr auto aSize = (sizeof(GEMM::a_value_type) * M * K);
-    constexpr auto abSize = aSize + (sizeof(GEMM::b_value_type) * N * K);
-    constexpr auto abcSize = abSize + (sizeof(GEMM::c_value_type) * M * N);
-    constexpr auto len = abcSize + (sizeof(GEMM::c_value_type) * cute::max(N, K));
+    constexpr auto aSize = (sizeof(inputValueType) * M * K);
+    constexpr auto abSize = aSize + (sizeof(weightValueType) * N * K);
+    constexpr auto abcSize = abSize + (sizeof(outValueType) * M * N);
+    constexpr auto len = abcSize + (sizeof(inputValueType) * cute::max(N, K));
     cuda::std::byte* abc;
     CUTE_CHECK_ERROR(cudaMallocAsync(&abc, len, playStream));
     CUTE_CHECK_LAST();
@@ -723,8 +738,8 @@ void testCollective() {
         make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
 
     // Populate bias vector
-    CAST_TO(outValueType, data + abcSize)[0] = static_cast<outValueType>(1.0);
-    CAST_TO(outValueType, data + abcSize)[1] = static_cast<outValueType>(2.0);
+    CAST_TO(inputValueType, data + abcSize)[0] = static_cast<inputValueType>(1.0);
+    CAST_TO(inputValueType, data + abcSize)[1] = static_cast<inputValueType>(2.0);
 
     mAHost(0, 0) = static_cast<inputValueType>(0.0);
     mAHost(0, 1) = static_cast<inputValueType>(1.0);
@@ -746,23 +761,23 @@ void testCollective() {
         make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
 
     // bias vector (1, N) broadcast to (M, N)
-    auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc + abcSize)),
+    auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
 
     // Second GEMM
-    auto mAx = make_tensor(cute::make_gmem_ptr(CAST_TO(GEMM::a_value_type, abc + abSize)),
+    auto mAx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
     auto mBx = make_tensor(cute::make_gmem_ptr(
-        CAST_TO(GEMM::b_value_type, abc + aSize)), make_layout(cute::make_shape(K, N), cute::make_stride(N, 1)));
-    auto mCx = make_tensor(cute::make_gmem_ptr(CAST_TO(GEMM::c_value_type, abc)),
+        CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(K, N), cute::make_stride(N, 1)));
+    auto mCx = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
     static_assert(cuda::std::is_same_v<outValueType, decltype(mCx)::value_type>);
 
-    auto mDx = make_tensor(cute::make_gmem_ptr(CAST_TO(GEMM::c_value_type, abc + abcSize)),
+    auto mDx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, K), cute::make_stride(0, 1)));
 
-    constexpr auto gemmSharedSize = (sizeof(GEMM::a_value_type) * GEMM::a_size)
-        + (sizeof(GEMM::b_value_type) + GEMM::b_size);
+    constexpr auto gemmSharedSize = (sizeof(inputValueType) * GEMM::a_size)
+        + (sizeof(weightValueType) + GEMM::b_size);
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 16*1024UL);
     using activation = cutlass::epilogue::thread::ReLU<outValueType>;
     deviceCollectiveMMA<GEMM, activation, sharedSize><<<1, 128, sharedSize, playStream>>>
@@ -796,7 +811,7 @@ void testAlloc() {
     nvshmem_finalize();
 }
 
-void debugLayout() {
+/*void debugLayout() {
     constexpr auto M = 128;
     constexpr auto N = 128;
     constexpr auto K = 8;
@@ -831,25 +846,18 @@ void debugLayout() {
                                          cute::Stride<cute::_8,cute::Stride<cute::_1,cute::_64>>>{});
     using tt2 = decltype(tile_to_shape(p::sLayA{},
       make_shape(shape<0>(TileShape{}), shape<2>(TileShape{}), cute::Int<2>{})));
-}
+}*/
 
-__device__ cute::tfloat32_t matABC[11264];
-template<class GEMM>
+__device__ cute::bfloat16_t matABC[3072];
+template<class GEMM, typename ElementA, typename ElementB, typename ElementC>
 requires (cublasdx::is_complete_blas<GEMM>::value
     && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
     && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
 __global__ void testSharedCopy() {
-    __shared__ cute::tfloat32_t sBuf[3072];
-    if (cute::thread0()) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            sBuf[i] = cute::tfloat32_t(0.01);
-            sBuf[2048 + i] = cute::tfloat32_t(0.03);
-        }
-    }
+    __shared__ ElementA sBuf[3072];
     __threadfence_block();
     __syncthreads();
-    using Parameters = CollectiveMMAConfig<GEMM>;
+    using Parameters = CollectiveMMAConfig<GEMM, ElementA, ElementB, ElementC>;
     auto copyA = typename Parameters::gCopyA{};
     auto copyB = typename Parameters::gCopyB{};
 
@@ -862,13 +870,11 @@ __global__ void testSharedCopy() {
 
     auto mA = make_tensor(cute::make_gmem_ptr(matABC), make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
     auto mB = make_tensor(cute::make_gmem_ptr(matABC + 1024), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
-    auto mC = make_tensor(cute::make_gmem_ptr(matABC + 1536), make_layout(cute::make_shape(M, N), cute::make_stride(1, M)));
 
     auto cta_coord = make_coord(0, 0, cute::_);
     using TileShape = cute::Shape<cute::Int<M>, cute::Int<N>, cute::Int<K>>;
     auto gA = local_tile(mA, TileShape{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     auto gB = local_tile(mB, TileShape{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
-    auto gC = local_tile(mC, TileShape{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
 
     using SmemLayoutA = decltype(tile_to_shape(
       typename Parameters::sLayA{},
@@ -880,31 +886,24 @@ __global__ void testSharedCopy() {
     auto sA = make_tensor(cute::make_smem_ptr(sBuf), SmemLayoutA{}); // (BLK_M,BLK_K,PIPE)
     auto sB = make_tensor(cute::make_smem_ptr(sBuf + 2048), SmemLayoutB{}); // (BLK_N,BLK_K,PIPE)
 
+#if 0
     if (cute::thread0()) {
         print_tensor(sA);
     }
-
+#endif
     auto tAgA = gmem_thr_copy_A.partition_S(gA);                             // (ACPY,ACPY_M,ACPY_K,k)
     auto tAsA = gmem_thr_copy_A.partition_D(sA);                             // (ACPY,ACPY_M,ACPY_K,PIPE)
     auto tBgB = gmem_thr_copy_B.partition_S(gB);                             // (BCPY,BCPY_N,BCPY_K,k)
     auto tBsB = gmem_thr_copy_B.partition_D(sB);                             // (BCPY,BCPY_N,BCPY_K,PIPE)
 
-    auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
-    int k_tile_count = size<2>(gA);
+    auto tiled_mma = typename Parameters::mma_t{};
+    using sCa = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, ElementA>;
+    using sCb = cute::Copy_Atom<cute::SM75_U32x2_LDSM_N, ElementB>;
 
-    auto tiled_mma = cute::TiledMMA<
-      cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>,
-      cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
-    cute::Tile<cute::_32, cute::_32, cute::_8>
-    >{};
-
-    static_assert(cuda::std::is_same_v<decltype(tiled_mma), typename Parameters::mma_t>);
-
-    //auto smem_tiled_copy_A = make_tiled_copy_A(typename Parameters::sCopyA{}, tiled_mma);
-    auto smem_tiled_copy_A = make_tiled_copy_A(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+    auto smem_tiled_copy_A = make_tiled_copy_A(sCa{}, tiled_mma);
     auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(threadIdx.x);
-    //auto smem_tiled_copy_B = make_tiled_copy_B(typename Parameters::sCopyB{}, tiled_mma);
-    auto smem_tiled_copy_B = make_tiled_copy_B(cute::Copy_Atom<cute::SM75_U32x4_LDSM_N, typename GEMM::a_value_type>{}, tiled_mma);
+
+    auto smem_tiled_copy_B = make_tiled_copy_B(sCb{}, tiled_mma);
     auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(threadIdx.x);
 
     auto tCsA = smem_thr_copy_A.partition_S(sA);
@@ -920,6 +919,7 @@ __global__ void testSharedCopy() {
     auto tCrA = thr_mma.partition_fragment_A(sA(cute::_,cute::_,0));
     auto tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);
 
+#if 0
     if (cute::thread0()) {
         print(tCrA); printf("\n");
         print(size(tCrA)); printf("\n");
@@ -940,8 +940,9 @@ __global__ void testSharedCopy() {
         cute::print_tensor(tCrA);
         printf("-------------------------------------\n");
     }
-    copy(smem_tiled_copy_A, tCsA_p(cute::_,cute::_,0), tCrA_copy_view(cute::_,cute::_,0));
-    copy(smem_tiled_copy_B, tCsB_p(cute::_,cute::_,0), tCrB_copy_view(cute::_,cute::_,0));
+#endif
+    cute::copy(smem_tiled_copy_A, tCsA_p(cute::_,cute::_,0), tCrA_copy_view(cute::_,cute::_,0));
+    cute::copy(smem_tiled_copy_B, tCsB_p(cute::_,cute::_,0), tCrB_copy_view(cute::_,cute::_,0));
 
     if (cute::thread0()) {
         cute::print_tensor(tCsA_p(cute::_,cute::_,0));
@@ -949,7 +950,7 @@ __global__ void testSharedCopy() {
     }
 }
 
-template<class GEMM>
+/*template<class GEMM>
 requires (cublasdx::is_complete_blas<GEMM>::value
     && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
     && cublasdx::sm_of<GEMM>::value >= MIN_ARCH)
@@ -1005,7 +1006,7 @@ __global__ void testGCopy() {
     auto tBsB = gmem_thr_copy_B.partition_D(sB);
 
     copy(copyB, tBgB(cute::_,cute::_,cute::_,0), tBsB(cute::_,cute::_,cute::_,0));
-}
+}*/
 
 template<typename T>
 void printType() {
@@ -1030,20 +1031,19 @@ void golfing() {
     constexpr auto M = 128;
     constexpr auto N = 64;
     constexpr auto K = 8;
-    using inputValueType = cublasdx::tfloat32_t;
-    using weightValueType = cublasdx::tfloat32_t;
+    using inputValueType = cute::bfloat16_t;
+    using weightValueType = cute::bfloat16_t;
     using outValueType = float;
     // Has to be (M, K) * (N, K)
     using GEMM = decltype(cublasdx::Size<M, N, K>()
-                          + cublasdx::Precision<inputValueType, weightValueType, outValueType>()
+                          + cublasdx::Precision<toCDX<inputValueType>, toCDX<weightValueType>, outValueType>()
                           + cublasdx::Type<cublasdx::type::real>()
                           + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
-    using Parameters = CollectiveMMAConfig<GEMM>;
 
-    testGCopy<GEMM><<<1,1>>>();
+    testSharedCopy<GEMM, inputValueType, weightValueType, outValueType><<<1,1>>>();
     CUTE_CHECK_LAST();
 }
 

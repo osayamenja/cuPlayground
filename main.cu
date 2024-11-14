@@ -1136,6 +1136,40 @@ void hostAMax() {
     free(p);
 }
 
+__device__ unsigned int counter[8] = {400U, 400U, 400U, 400U, 400U, 400U, 400U, 400U};
+__device__ unsigned int baton = 0U;
+__device__ cuda::std::atomic_flag interrupt{false};
+
+__global__ __maxnreg__(128) void atoEx(unsigned int* p) {
+    if (blockIdx.x == 0) {
+        for (int i = 0; i < 8; ++i) {
+            for (unsigned int j = threadIdx.x; j < 401; j += 128) {
+                atomicExch(p + j, i + 1);
+            }
+        }
+    }
+    else {
+        if (threadIdx.x == 0) {
+            float durationEx = 0.0;
+            for (int i = 0; i < 8; ++i) {
+                size_t start, end;
+                unsigned int x = 0U, next=0U;
+                asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+                // pass on
+                while (atomicOr(p + blockIdx.x, 0U) == i) {}
+                asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+                durationEx += static_cast<float>(end - start) / 8.0f;
+            }
+            //printf("Block %u, V: %u, AtoEx Val: %f\n", blockIdx.x, atomicOr(p + blockIdx.x, 0U), durationEx);
+        }
+    }
+}
 int main() {
-    testCollective();
+    void* p;
+    constexpr std::array<unsigned int, 400> arr{};
+    CUTE_CHECK_ERROR(cudaMallocAsync(&p, sizeof(unsigned int)*arr.size(), cudaStreamPerThread));
+    CUTE_CHECK_ERROR(cudaMemsetAsync(p, 0, sizeof(unsigned int)*arr.size(),
+        cudaStreamPerThread));
+    atoEx<<<401,128,0,cudaStreamPerThread>>>(static_cast<unsigned int*>(p));
+    CUTE_CHECK_LAST();
 }

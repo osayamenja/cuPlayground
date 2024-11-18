@@ -21,6 +21,26 @@
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
 #define PIPELINE_STAGES 2
 
+template<typename T>
+using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
+        __half,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::bfloat16_t>,
+        __nv_bfloat16,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e4m3_t>,
+        __nv_fp8_e4m3,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e5m2_t>,
+        __nv_fp8_e5m2, T>>>>;
+
+template<typename T>
+using toCT = cuda::std::conditional_t<cuda::std::is_same_v<T, __half>,
+        cute::half_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_bfloat16>,
+        cute::bfloat16_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e4m3>,
+        cute::float_e4m3_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e5m2>,
+        cute::float_e5m2_t, T>>>>;
+
 template<unsigned int Arch, typename TC, typename TA=TC, typename TB=TA>
 struct MMAConfig {
     using mma = cute::TiledMMA<
@@ -212,10 +232,10 @@ requires (sizeof(T) == 2 || sizeof(T) == 4)
 using MiddleSwizzle = cute::Int<sizeof(T) == 2 ? 3 : 2>;
 
 template<class GEMM,
-typename ElementA = typename GEMM::a_value_type,
-typename ElementB = typename GEMM::b_value_type,
-typename ElementC = typename GEMM::c_value_type,
-LayoutOptimization lOpt = LayoutOptimization::UseVanilla>
+LayoutOptimization lOpt = LayoutOptimization::UseVanilla,
+typename ElementA = toCT<typename GEMM::a_value_type>,
+typename ElementB = toCT<typename GEMM::b_value_type>,
+typename ElementC = toCT<typename GEMM::c_value_type>>
 requires (cublasdx::is_complete_blas<GEMM>::value
 && cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
 && cublasdx::sm_of<GEMM>::value >= MIN_ARCH

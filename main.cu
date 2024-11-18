@@ -439,8 +439,12 @@ auto fusedAddActivate(Element& accumulator, const Element& term, const Activatio
         return op(fma(Element(1.0f), accumulator, term));
     }
     if constexpr(sizeof(Element) == 2) {
-        // Half precision FMA
-        return op(__hfma(Element(1.0f), accumulator, term));
+        // Half FMA
+        if constexpr (cuda::std::is_same_v<Element, cute::half_t>) {
+            return op(cute::half_t(__hfma(__half(1.0f), accumulator.to_half(), term.to_half())));
+        }
+        // bfloat16 FMA
+        return op(cute::bfloat16_t(__hfma(__nv_bfloat16(1.0f), accumulator.to_nv_bfloat16(), term.to_nv_bfloat16())));
     }
     return op(accumulator + term);
 }
@@ -495,9 +499,9 @@ __device__ unsigned int syncP = 0;
 template<class BlockMM, typename ActivationOp = cute::identity, unsigned int sharedSize,
 typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD,
 typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx,
-typename ElementA = typename MatrixAx::value_type,
-typename ElementB = typename MatrixBx::value_type,
-typename ElementC = typename MatrixCx::value_type>
+typename ElementA = toCT<typename BlockMM::a_value_type>,
+typename ElementB = toCT<typename BlockMM::b_value_type>,
+typename ElementC = toCT<typename BlockMM::c_value_type>>
 requires (cute::is_tensor_v<MatrixA>
     && cute::is_tensor_v<MatrixB>
     && cute::is_tensor_v<MatrixC>
@@ -513,11 +517,11 @@ requires (cute::is_tensor_v<MatrixA>
     && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
     && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
 __global__ __maxnreg__(128) void deviceCollectiveMMA(
-    const MatrixA mA, const MatrixB mB, MatrixC mC, const MatrixD mD,
-    const MatrixAx mAx, const MatrixBx mBx, MatrixCx mCx, const MatrixDx mDx) {
+    const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD,
+    const MatrixAx mAx, const MatrixBx mBx, const MatrixCx mCx, const MatrixDx mDx) {
     static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
     static_assert(rank(mAx) == 2 && rank(mBx) == 2 && rank(mCx) == 2 && rank(mDx) == 2);
-    using Parameters = CollectiveMMAConfig<BlockMM, ElementA, ElementB, ElementC, LayoutOptimization::UseSwizzle>;
+    using Parameters = CollectiveMMAConfig<BlockMM, LayoutOptimization::UseSwizzle>;
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
     constexpr auto bK = cublasdx::size_of<BlockMM>::k;
@@ -641,7 +645,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     gA = local_tile(mAx, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
     gB = local_tile(mBx, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
-    auto gCx = local_tile(mCx, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+    gC = local_tile(mCx, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
     gD = local_tile(mDx, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
 
     auto k_tile_iterX = cute::make_coord_iterator(size<2>(gA));
@@ -662,7 +666,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     // Epilogue
     tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
-    auto tCgCx = tiledMMA.get_slice(threadIdx.x).partition_C(gCx);
+    tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
 
     CUTE_UNROLL
     for (int i = 0; i < trips; ++i) {
@@ -674,7 +678,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         // Fused Bias Add on register fragment
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            tCgCx(j + i * elems) = gCStoreOp(accum(j + i * elems) + scratch[threadIdx.x + j * THREADS]);
+            tCgC(j + i * elems) = gCStoreOp(accum(j + i * elems) + scratch[threadIdx.x + j * THREADS]);
         }
     }
     __threadfence(); // Ensures writes are visible device-wide
@@ -691,16 +695,6 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 #endif
 }
 
-template<typename T>
-using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
-        __half,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::bfloat16_t>,
-        __nv_bfloat16,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e4m3_t>,
-        __nv_fp8_e4m3,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e5m2_t>,
-        __nv_fp8_e5m2, T>>>>;
-
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
     constexpr auto M = 128;
@@ -711,12 +705,13 @@ void testCollective() {
     constexpr auto bN = 64;
     constexpr auto bK = 8;
     using inputValueType = cute::half_t;
+    using outValueType = inputValueType;
     using weightValueType = cute::half_t;
-    using outValueType = float;
+    using accumulateType = float;
 
     // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<bM, bN, bK>()
-                          + cublasdx::Precision<toCDX<inputValueType>, toCDX<weightValueType>, outValueType>()
+                          + cublasdx::Precision<toCDX<inputValueType>, toCDX<weightValueType>, accumulateType>()
                           + cublasdx::Type<cublasdx::type::real>()
                           + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
                           + cublasdx::Function<cublasdx::function::MM>()
@@ -773,15 +768,14 @@ void testCollective() {
         CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(K, N), cute::make_stride(N, 1)));
     auto mCx = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
-    static_assert(cuda::std::is_same_v<outValueType, decltype(mCx)::value_type>);
 
     auto mDx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, K), cute::make_stride(0, 1)));
 
     constexpr auto gemmSharedSize = (sizeof(inputValueType) * GEMM::a_size)
         + (sizeof(weightValueType) + GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 16*1024UL);
-    using activation = cutlass::epilogue::thread::ReLU<outValueType>;
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 8*1024UL);
+    using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
     deviceCollectiveMMA<GEMM, activation, sharedSize><<<1, 128, sharedSize, playStream>>>
     (mA, mB, mC, mD,
         mAx, mBx, mCx, mDx);
@@ -859,7 +853,7 @@ __global__ void testSharedCopy() {
     __shared__ ElementA sBuf[3072];
     __threadfence_block();
     __syncthreads();
-    using Parameters = CollectiveMMAConfig<GEMM, ElementA, ElementB, ElementC>;
+    using Parameters = CollectiveMMAConfig<GEMM>;
     auto copyA = typename Parameters::gCopyA{};
     auto copyB = typename Parameters::gCopyB{};
 
@@ -1248,6 +1242,44 @@ void streamPersist(void* p, const unsigned long& bytes) {
     cudaStreamSetAttribute(cudaStreamPerThread, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
 }
 
-int main() {
+__constant__ __inline__ unsigned int x = 80U;
+__global__ __maxnreg__(32) void benchContention(unsigned int* p) {
+    constexpr auto rounds = 1024U;
+    float duration = 0.0;
+    __shared__ float scratch;
+    if (cooperative_groups::thread_block::thread_rank() == 0) {
+        scratch = 0.0f;
+    }
+    __syncthreads();
+    for (int i = 0; i < rounds; ++i) {
+        size_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        atomicAdd(p, 1U);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        duration += static_cast<float>(end - start) / rounds;
+    }
+    __syncthreads();
+    cuda::std::ignore = cuda::atomic_ref{scratch}.fetch_max(duration);
+    __syncthreads();
+    if (cooperative_groups::thread_block::thread_rank() == 0) {
+        printf("Block %lu: Time to do work is %f and x is %u\n",
+            cooperative_groups::grid_group::block_rank(), scratch, x);
+    }
+}
 
+void benchContentionHost() {
+    void* p;
+    CUTE_CHECK_ERROR(cudaMalloc(&p, sizeof(unsigned int)));
+    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(unsigned int)));
+    benchContention<<<431, 128>>>(static_cast<unsigned int *>(p));
+    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(unsigned int)));
+    CUTE_CHECK_ERROR(cudaDeviceSynchronize());
+    printf("--------------------------------------------------\n");
+    streamPersist(p, sizeof(unsigned int));
+    benchContention<<<431, 128, 0, cudaStreamPerThread>>>(static_cast<unsigned int *>(p));
+    CUTE_CHECK_LAST();
+}
+
+int main() {
+    benchContentionHost();
 }

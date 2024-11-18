@@ -27,6 +27,8 @@
 #include "processor/tiling.cuh"
 #include "processor/gemm.cuh"
 
+#include <cuda/experimental/device.cuh>
+
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define BYTE_CAST(p) static_cast<cuda::std::byte*>(static_cast<void*>(p))
 #define NANO_TO_MICRO (cuda::std::nano::den / cuda::std::micro::den)
@@ -1142,6 +1144,7 @@ __device__ cuda::std::atomic_flag interrupt{false};
 
 __global__ __maxnreg__(128) void atoEx(unsigned int* p) {
     if (blockIdx.x == 0) {
+        // producer
         for (int i = 0; i < 8; ++i) {
             for (unsigned int j = threadIdx.x; j < 401; j += 128) {
                 atomicExch(p + j, i + 1);
@@ -1150,6 +1153,7 @@ __global__ __maxnreg__(128) void atoEx(unsigned int* p) {
     }
     else {
         if (threadIdx.x == 0) {
+            // consumer
             float durationEx = 0.0;
             for (int i = 0; i < 8; ++i) {
                 size_t start, end;
@@ -1160,11 +1164,12 @@ __global__ __maxnreg__(128) void atoEx(unsigned int* p) {
                 asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
                 durationEx += static_cast<float>(end - start) / 8.0f;
             }
-            //printf("Block %u, V: %u, AtoEx Val: %f\n", blockIdx.x, atomicOr(p + blockIdx.x, 0U), durationEx);
+            printf("Block %u, V: %u, AtoEx Val: %f\n", blockIdx.x, atomicOr(p + blockIdx.x, 0U), durationEx);
         }
     }
 }
-int main() {
+
+void atoExHost() {
     void* p;
     constexpr std::array<unsigned int, 400> arr{};
     CUTE_CHECK_ERROR(cudaMallocAsync(&p, sizeof(unsigned int)*arr.size(), cudaStreamPerThread));
@@ -1172,4 +1177,77 @@ int main() {
         cudaStreamPerThread));
     atoEx<<<401,128,0,cudaStreamPerThread>>>(static_cast<unsigned int*>(p));
     CUTE_CHECK_LAST();
+}
+
+void __global__ benchShared(float in) {
+    extern __shared__ cuda::std::byte pad[];
+    bool* interrupt = CAST_TO(bool, pad);
+    if (cooperative_groups::thread_block::thread_rank() == 0) {
+        *interrupt = false;
+    }
+    for (unsigned int i = threadIdx.x; i < 4096; i += 128) {
+        CAST_TO(float, pad)[i] = 0.0f;
+    }
+    __syncthreads();
+
+    while (!*interrupt) {
+        for (unsigned int i = threadIdx.x; i < 4096; i += 128) {
+            CAST_TO(float, pad)[i] += 0.1f;
+        }
+        if (cooperative_groups::thread_block::thread_rank() == 0) {
+            interrupt[0] = CAST_TO(float, pad)[0] > in;
+        }
+        __syncthreads();
+    }
+}
+
+void persisting() {
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, 0);
+    std::cout << "L2 Cache: " << prop.l2CacheSize << " L2 Persist Window: " << prop.accessPolicyMaxWindowSize << std::endl;
+    int dev = 0, devAttr = 0;
+    CUTE_CHECK_ERROR(cudaDeviceGetAttribute(&devAttr, cudaDevAttrL2CacheSize, dev));
+}
+
+__global__ void benchPersist(unsigned int* p) {
+    constexpr auto rounds = 1024U;
+    const auto tid = cooperative_groups::thread_block::thread_rank();
+    float duration = 0.0;
+    for (int i = 0; i < rounds; ++i) {
+        size_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        for (unsigned int j = 0; j < 128 * 128; j += 128) {
+            auto x = p[j];
+            p[j] = tid + static_cast<unsigned int>(x * sinf(static_cast<float>(tid)));
+        }
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        duration += static_cast<float>(end - start) / (static_cast<float>(NANO_TO_MICRO) * rounds);
+    }
+    __syncthreads();
+    auto result = CAST_TO(float, p);
+    result[0] = 0.0;
+    cuda::std::ignore = cuda::atomic_ref{result[0]}.fetch_max(duration);
+    __syncthreads();
+    if (tid == 0) {
+        printf("Time to do work is %f\n", result[0]);
+        result[0] = 0.0;
+    }
+}
+
+void streamPersist(void* p, const unsigned long& bytes) {
+    cudaStreamAttrValue stream_attribute;   // Stream level attributes data structure
+    stream_attribute.accessPolicyWindow.base_ptr  = p; // Global Memory data pointer
+    // Number of bytes for persistence access.
+    stream_attribute.accessPolicyWindow.num_bytes = bytes;
+    // (Must be less than cudaDeviceProp::accessPolicyMaxWindowSize)
+    stream_attribute.accessPolicyWindow.hitRatio  = 1.0;                          // Hint for cache hit ratio
+    stream_attribute.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting; // Type of access property on cache hit
+    stream_attribute.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;  // Type of access property on cache miss.
+
+    //Set the attributes to a CUDA stream of type cudaStream_t
+    cudaStreamSetAttribute(cudaStreamPerThread, cudaStreamAttributeAccessPolicyWindow, &stream_attribute);
+}
+
+int main() {
+
 }

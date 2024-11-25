@@ -27,6 +27,7 @@
 #include "processor/tiling.cuh"
 #include "processor/gemm.cuh"
 
+#include <cuda/semaphore>
 #include <cuda/experimental/device.cuh>
 
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
@@ -495,8 +496,42 @@ void __global__ benchFAA() {
 }
 
 __device__ unsigned int syncP = 0;
+
+template<typename ElementA, typename ElementB, typename ElementC, unsigned int Arch>
+struct ProcessorGEMM {
+    using BlockMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, BLOCK_K_FULL>()
+                          + cublasdx::Precision<toCDX<ElementA>, toCDX<ElementB>, toCDX<ElementC>>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<Arch>()
+                          + cublasdx::Block()
+                          + cublasdx::BlockDim<THREADS>());
+    using blockTiler = cute::Shape<cute::Int<cublasdx::size_of<BlockMM>::m>,
+                                    cute::Int<cublasdx::size_of<BlockMM>::n>,
+                                    cute::Int<cublasdx::size_of<BlockMM>::k>>;
+    using Parameters = CollectiveMMAConfig<BlockMM, LayoutOptimization::UseSwizzle>;
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        typename Parameters::dispatch,
+        blockTiler,
+        ElementA,
+        cute::Underscore,
+        ElementB,
+        cute::Underscore,
+        typename Parameters::mma_t,
+        typename Parameters::gCopyA,
+        typename Parameters::sLayA,
+        typename Parameters::sCopyA,
+        cute::identity,
+        typename Parameters::gCopyB,
+        typename Parameters::sLayB,
+        typename Parameters::sCopyB,
+        cute::identity
+    >;
+};
+
 // <=96 registers: <= 5 blocks
-template<class BlockMM, typename ActivationOp = cute::identity, unsigned int sharedSize,
+template<class BlockMM, typename ActivationOp = cute::identity,
 typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD,
 typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx,
 typename ElementA = toCT<typename BlockMM::a_value_type>,
@@ -569,7 +604,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     int k_tile_count = size<2>(gA);
 
     extern __shared__ ElementC scratch[];
-    CollectiveMainloop collective_mma;
+    typename ProcessorGEMM<ElementA, ElementB, ElementC, 800>::CollectiveMainloop collective_mma;
     collective_mma(
         accum,
         gA,
@@ -579,9 +614,6 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         cute::Underscore{},
         threadIdx.x,
         CAST_TO(char, scratch));
-
-    // Ensure shared memory is ready for reuse
-    __syncthreads();
 
     // Epilogue
     auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -594,9 +626,9 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     // Assume unary operator
     ActivationOp epilogueOp{};
-    constexpr auto elemsBytes = sharedSize / THREADS;
-    constexpr auto trips = size(accum) * sizeof(ElementC) / elemsBytes;
-    constexpr auto elems = elemsBytes / sizeof(ElementC);
+    constexpr auto elems = 32;
+    constexpr auto trips = size(accum) / elems;
+    cutlass::AlignedArray<ElementC, elems> rScratch{};
     // Instead of shared memory, we could use 32 registers per trip, for the workspace instead.
     // We would be within the budget (32 + 64 <= 100) and, as a bonus, bypass the above barrier as well.
     // However, then we would be at the mercy of the compiler,
@@ -609,14 +641,14 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         // Use addressing that minimizes bank conflicts in shared memory
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            scratch[threadIdx.x + j * THREADS] = gDLoadOp(tDgD(j + i * elems));
+            rScratch[j] = gDLoadOp(tDgD(j + i * elems));
         }
         // Fused Bias Add and Activation Function on register fragment
         // Also fuses copy to GMEM
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
             tCgC(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
-                scratch[threadIdx.x + j * THREADS], epilogueOp));
+                rScratch[j], epilogueOp));
         }
     }
 
@@ -632,13 +664,13 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     }
 #endif
 #if 1
-    if (threadIdx.x == 0) {
+    /*if (threadIdx.x == 0) {
         // Signal that this tile is available
         atomicAdd(&syncP, 1);
         // Wait until all tiles are ready.
         while (atomicCAS(&syncP, 0U, 0U) % kChunks != 0){}
     }
-    __syncthreads();
+    __syncthreads();*/
 
     // Clear accumulator registers in preparation
     cute::clear(accum);
@@ -662,8 +694,6 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         threadIdx.x,
         CAST_TO(char, scratch));
 
-    __syncthreads();
-
     // Epilogue
     tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
     tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -673,12 +703,12 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         // Prefetch
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            scratch[threadIdx.x + j * THREADS] = gDLoadOp(tDgD(j + i * elems));
+            rScratch[j] = gDLoadOp(tDgD(j + i * elems));
         }
         // Fused Bias Add on register fragment
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            tCgC(j + i * elems) = gCStoreOp(accum(j + i * elems) + scratch[threadIdx.x + j * THREADS]);
+            tCgC(j + i * elems) = gCStoreOp(accum(j + i * elems) + rScratch[j]);
         }
     }
     __threadfence(); // Ensures writes are visible device-wide
@@ -774,9 +804,9 @@ void testCollective() {
 
     constexpr auto gemmSharedSize = (sizeof(inputValueType) * GEMM::a_size)
         + (sizeof(weightValueType) + GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 8*1024UL);
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES);
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
-    deviceCollectiveMMA<GEMM, activation, sharedSize><<<1, 128, sharedSize, playStream>>>
+    deviceCollectiveMMA<GEMM, activation><<<1, 128, sharedSize, playStream>>>
     (mA, mB, mC, mD,
         mAx, mBx, mCx, mDx);
     CUTE_CHECK_LAST();
@@ -1243,43 +1273,161 @@ void streamPersist(void* p, const unsigned long& bytes) {
 }
 
 __constant__ __inline__ unsigned int x = 80U;
-__global__ __maxnreg__(32) void benchContention(unsigned int* p) {
-    constexpr auto rounds = 1024U;
-    float duration = 0.0;
-    __shared__ float scratch;
+template<typename T>
+__global__ __maxnreg__(32) void benchContention(T* p, const __grid_constant__ T top) {
     if (cooperative_groups::thread_block::thread_rank() == 0) {
+        constexpr auto rounds = 1024U;
+        float duration = 0.0;
+        __shared__ float scratch;
         scratch = 0.0f;
-    }
-    __syncthreads();
-    for (int i = 0; i < rounds; ++i) {
-        size_t start, end;
-        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
-        atomicAdd(p, 1U);
-        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-        duration += static_cast<float>(end - start) / rounds;
-    }
-    __syncthreads();
-    cuda::std::ignore = cuda::atomic_ref{scratch}.fetch_max(duration);
-    __syncthreads();
-    if (cooperative_groups::thread_block::thread_rank() == 0) {
+        for (int i = 0; i < rounds; ++i) {
+            size_t start, end;
+            asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+            atomicExch(p, 23UL);
+            asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+            duration += static_cast<float>(end - start) / rounds;
+        }
+        cuda::std::ignore = cuda::atomic_ref{scratch}.fetch_max(duration);
         printf("Block %lu: Time to do work is %f and x is %u\n",
             cooperative_groups::grid_group::block_rank(), scratch, x);
     }
 }
 
 void benchContentionHost() {
+    using at = unsigned long long int;
+    constexpr at t = (431 * 1024) + 1;
     void* p;
-    CUTE_CHECK_ERROR(cudaMalloc(&p, sizeof(unsigned int)));
-    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(unsigned int)));
-    benchContention<<<431, 128>>>(static_cast<unsigned int *>(p));
-    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(unsigned int)));
+    CUTE_CHECK_ERROR(cudaMalloc(&p, sizeof(at)));
+    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(at)));
+    benchContention<<<431, 128>>>(static_cast<at*>(p), t);
+    CUTE_CHECK_ERROR(cudaMemset(p, 0, sizeof(at)));
     CUTE_CHECK_ERROR(cudaDeviceSynchronize());
     printf("--------------------------------------------------\n");
-    streamPersist(p, sizeof(unsigned int));
-    benchContention<<<431, 128, 0, cudaStreamPerThread>>>(static_cast<unsigned int *>(p));
+    streamPersist(p, sizeof(at));
+    benchContention<<<431, 128, 0, cudaStreamPerThread>>>(static_cast<at *>(p), t);
+    CUTE_CHECK_LAST();
+    at x;
+    CUTE_CHECK_ERROR(cudaMemcpy(&x, p, sizeof(at), cudaMemcpyDeviceToHost));
+    printf("p is %lu", x);
+}
+
+__device__ unsigned int res = 0U;
+__global__ void slowMod(unsigned int rounds) {
+    auto z = 0U;
+    float duration = 0.0f;
+    for (int i = 0; i < rounds; ++i) {
+        size_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        z = i % gridDim.x;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        duration += static_cast<float>(end - start) / rounds;
+    }
+    atomicExch(&res, z);
+
+    if (cooperative_groups::grid_group::block_rank() == 0) {
+        printf("slowMod takes: %f\n", duration);
+    }
+}
+
+template<unsigned int p>
+__global__ void fastMod(unsigned int rounds) {
+    auto x = 0U;
+    float duration = 0.0f;
+    for (unsigned int i = 0; i < rounds; ++i) {
+        size_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        x = i % p;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        duration += static_cast<float>(end - start) / rounds;
+    }
+    atomicExch(&res, x);
+    if (cooperative_groups::grid_group::block_rank() == 0) {
+        printf("FastMod takes: %f\n", duration);
+    }
+
+}
+
+void testModHost() {
+    volatile int x = 800;
+    volatile uint rounds = 1024;
+    slowMod<<<x, 1>>>(rounds);
     CUTE_CHECK_LAST();
 }
 
+__device__ unsigned int q[3];
+__global__ void testScheduler(unsigned int bound, bool skip = true) {
+    if (threadIdx.x == 0) {
+        __shared__ unsigned int up;
+        up = bound;
+        unsigned int sX = 0U;
+        unsigned int tail = 0U;
+        size_t start = 0, end = 0;
+        q[0] = bound;
+        q[1] = bound;
+        q[2] = 0U;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        while (sX < atomicOr_block(&up, 0U)) {
+            auto x = atomicOr(q, 0U) - sX;
+            while (x > 0) {
+                auto y = atomicOr(q + 1, 0U) - tail;
+                while ( y > 0 && x > 0) {
+                    ++sX;
+                    --x;
+                    ++tail;
+                    --y;
+                }
+            }
+            // while (atomicOr(q, 0U) > sX && atomicOr(q + 1, 0U) > tail) {
+            //     ++sX;
+            //     ++tail;
+            // }
+        }
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        if (!skip) {
+            printf("single takes: %f\n", static_cast<float>(end - start) / 1e3);
+        }
+
+    }
+}
+
+__global__ void benchAtAdd(const unsigned int __grid_constant__ bound, bool skip = true) {
+    if (!threadIdx.x) {
+        q[0] = 0U;
+    }
+    __syncthreads();
+    float d = 0.0f, d2 = 0.0f;
+    for (int i = 0; i < bound; ++i) {
+        size_t start = 0, end = 0;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        atomicAdd(q, 1U);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        d += static_cast<float>(end - start) / static_cast<float>(bound);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        atomicInc(q, UINT32_MAX);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        d2 += static_cast<float>(end - start) / static_cast<float>(bound);
+    }
+    __syncthreads();
+    if (!threadIdx.x && !skip) {
+        printf("atAdd takes: %f, atInc takes: %f, val is %u, *val++ is %u\n", d, d2, *q, ++*q);
+        *q += 1;
+        printf("val: %u", *q);
+    }
+}
+
+void hostBenchAtAdd() {
+    volatile unsigned int b = 4096;
+    for (int i = 0; i < 128; ++i) {
+        benchAtAdd<<<1,864>>>(b);
+    }
+    benchAtAdd<<<1,864>>>(b, false);
+    CUTE_CHECK_LAST();
+}
 int main() {
-    benchContentionHost();
+    volatile unsigned int b = 4096;
+    for (int i = 0; i < 128; ++i) {
+        testScheduler<<<1,1>>>(b);
+    }
+    testScheduler<<<1,1>>>(b, false);
+    CUTE_CHECK_LAST();
 }

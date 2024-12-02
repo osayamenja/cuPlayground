@@ -20,6 +20,7 @@
 #include <cutlass/gemm/collective/collective_mma.hpp>
 #include <fmt/ranges.h>
 #include <cuda.h>
+#include <cuda/annotated_ptr>
 #include <nccl.h>
 #include <nvshmemx.h>
 #include <nvshmem.h>
@@ -532,6 +533,7 @@ struct ProcessorGEMM {
 
 // <=96 registers: <= 5 blocks
 template<class BlockMM, typename ActivationOp = cute::identity,
+unsigned int sharedSize = 16 * 1024,
 typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD,
 typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx,
 typename ElementA = toCT<typename BlockMM::a_value_type>,
@@ -550,7 +552,8 @@ requires (cute::is_tensor_v<MatrixA>
     && cuda::std::is_same_v<typename MatrixB::value_type, typename MatrixBx::value_type>
     && cublasdx::is_complete_blas<BlockMM>::value
     && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
-    && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH)
+    && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH
+    && sharedSize % THREADS == 0)
 __global__ __maxnreg__(128) void deviceCollectiveMMA(
     const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD,
     const MatrixAx mAx, const MatrixBx mBx, const MatrixCx mCx, const MatrixDx mDx) {
@@ -586,6 +589,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     typename Parameters::mma_t tiledMMA;
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
+    static_assert(cuda::std::is_same_v<ElementC, typename decltype(accum)::value_type>);
     cute::clear(accum);
 
     // Get the appropriate blocks for this thread block
@@ -603,7 +607,8 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
 
-    extern __shared__ ElementC scratch[];
+    using ElementD = typename decltype(gD)::value_type;
+    extern __shared__ ElementD scratch[];
     typename ProcessorGEMM<ElementA, ElementB, ElementC, 800>::CollectiveMainloop collective_mma;
     collective_mma(
         accum,
@@ -614,6 +619,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         cute::Underscore{},
         threadIdx.x,
         CAST_TO(char, scratch));
+    __syncthreads();
 
     // Epilogue
     auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -621,38 +627,46 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     // Accounts for GEMMs that accumulate in types differing from input types,
     // given that the result moonlights as the input for the succeeding GEMM.
-    auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, typename decltype(accum)::value_type>{};
-    auto gDLoadOp = cutlass::NumericConverter<typename decltype(accum)::value_type, typename decltype(tDgD)::value_type>{};
+    auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, ElementC>{};
+    auto gDLoadOp = cutlass::NumericConverter<ElementC, ElementD>{};
 
     // Assume unary operator
     ActivationOp epilogueOp{};
-    constexpr auto elems = 32;
+    constexpr auto elems = sharedSize / (THREADS * sizeof(ElementD));
+    static_assert(size(accum) % elems == 0);
     constexpr auto trips = size(accum) / elems;
-    cutlass::AlignedArray<ElementC, elems> rScratch{};
-    // Instead of shared memory, we could use 32 registers per trip, for the workspace instead.
-    // We would be within the budget (32 + 64 <= 100) and, as a bonus, bypass the above barrier as well.
-    // However, then we would be at the mercy of the compiler,
-    // who may or may not reuse previous MMA register allocations (24 to be exact),
-    // thus causing spills to local memory.
+    // Leverage compiler packing for half-precision values into one register
+    cutlass::AlignedArray<ElementD, elems> rScratch{};
+
+    // Prefetch from global to shared memory
+    CUTE_UNROLL
+    for (int j = 0; j < elems; ++j) {
+        scratch[threadIdx.x + j * THREADS] = tDgD(j);
+    }
 
     CUTE_UNROLL
     for (int i = 0; i < trips; ++i) {
-        // Prefetch from global to shared memory that will be reused per trip
-        // Use addressing that minimizes bank conflicts in shared memory
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
-            rScratch[j] = gDLoadOp(tDgD(j + i * elems));
+            rScratch[j] = scratch[threadIdx.x + j * THREADS];
+            if (i + 1 < trips) {
+                // Eagerly start loads for the next batch
+                scratch[threadIdx.x + j * THREADS] = tDgD(j + i * elems);
+            }
         }
         // Fused Bias Add and Activation Function on register fragment
         // Also fuses copy to GMEM
         CUTE_UNROLL
         for (int j = 0; j < elems; ++j) {
             tCgC(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
-                rScratch[j], epilogueOp));
+                gDLoadOp(rScratch[j]), epilogueOp));
         }
     }
 
-    __threadfence(); // Ensures writes are visible device-wide
+    __syncthreads();
+    if (!threadIdx.x) {
+        __threadfence_system();
+    }
     __syncthreads();
 
 #if 0
@@ -663,7 +677,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         cute::print_tensor(mC);
     }
 #endif
-#if 1
+#if 0
     /*if (threadIdx.x == 0) {
         // Signal that this tile is available
         atomicAdd(&syncP, 1);
@@ -804,7 +818,7 @@ void testCollective() {
 
     constexpr auto gemmSharedSize = (sizeof(inputValueType) * GEMM::a_size)
         + (sizeof(weightValueType) + GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES);
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 32 * 4);
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
     deviceCollectiveMMA<GEMM, activation><<<1, 128, sharedSize, playStream>>>
     (mA, mB, mC, mD,
@@ -1355,9 +1369,18 @@ void testModHost() {
 }
 
 __device__ unsigned int q[3];
+constexpr unsigned int bb = 4096;
+__device__ unsigned int qq[bb];
+__device__ unsigned int pDB[bb];
+template<unsigned int p>
 __global__ void testScheduler(unsigned int bound, bool skip = true) {
     if (threadIdx.x == 0) {
         __shared__ unsigned int up;
+        __shared__ unsigned int rQ[p];
+        #pragma unroll
+        for (int i = 0; i < p; ++i) {
+            rQ[i] = i;
+        }
         up = bound;
         unsigned int sX = 0U;
         unsigned int tail = 0U;
@@ -1371,10 +1394,12 @@ __global__ void testScheduler(unsigned int bound, bool skip = true) {
             while (x > 0) {
                 auto y = atomicOr(q + 1, 0U) - tail;
                 while ( y > 0 && x > 0) {
+                    auto r = qq[tail];
                     ++sX;
                     --x;
                     ++tail;
                     --y;
+                    atomicExch(pDB + r, sX);
                 }
             }
             // while (atomicOr(q, 0U) > sX && atomicOr(q + 1, 0U) > tail) {
@@ -1417,17 +1442,61 @@ __global__ void benchAtAdd(const unsigned int __grid_constant__ bound, bool skip
 
 void hostBenchAtAdd() {
     volatile unsigned int b = 4096;
+    assert(b == bb);
     for (int i = 0; i < 128; ++i) {
         benchAtAdd<<<1,864>>>(b);
     }
     benchAtAdd<<<1,864>>>(b, false);
     CUTE_CHECK_LAST();
 }
-int main() {
+
+void hostSc() {
+    CUTE_CHECK_ERROR(cudaSetDevice(1));
     volatile unsigned int b = 4096;
     for (int i = 0; i < 128; ++i) {
-        testScheduler<<<1,1>>>(b);
+        testScheduler<bb><<<1,1>>>(b);
     }
-    testScheduler<<<1,1>>>(b, false);
+    testScheduler<bb><<<1,1>>>(b, false);
     CUTE_CHECK_LAST();
+}
+
+void mmaGolfing() {
+    constexpr auto mma = cute::TiledMMA<
+          cute::MMA_Atom<cute::SM80_16x8x8_F32F16F16F32_TN>,
+          cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
+        cute::Tile<cute::_64, cute::_32, cute::_8>
+        >{};
+    print_latex(mma);
+}
+
+__global__ void expBench() {
+    constexpr auto k = 64;
+    cutlass::AlignedArray<float, cute::max(k, 32)> rScratch{};
+    __shared__ float gateScratch[128];
+    if (!threadIdx.x) {
+        #pragma unroll
+        for (uint i = 0; i < 128; ++i) {
+            gateScratch[i] = static_cast<float>(i);
+        }
+    }
+    __syncthreads();
+
+    /*using sCLay = cute::Layout<cute::Shape<cute::Int<64>, cute::Int<2>>>;*/
+    using sCLayX = cute::Layout<cute::Shape<cute::Int<64>, cute::Int<2>>, cute::Stride<cute::_2, cute::_1>>;
+    constexpr auto l = make_layout(cute::Shape<cute::Int<64>, cute::Int<2>>{}, cute::LayoutRight{});
+    /*using sCLay2 = cute::Layout<cute::Shape<cute::Int<2>, cute::Int<64>>>;
+    using sCLay2X = cute::Layout<cute::Shape<cute::Int<2>, cute::Int<64>>, cute::Stride<cute::_64, cute::_1>>;*/
+    /*print_tensor(make_tensor(cute::make_smem_ptr(gateScratch), sCLay{}));
+    printf("t(1): %f\n", make_tensor(cute::make_smem_ptr(gateScratch), sCLay{})(1));*/
+    auto t = make_tensor(cute::make_smem_ptr(gateScratch), l);
+    /*print_tensor(t);
+    printf("t(1): %f\n", make_tensor(cute::make_smem_ptr(gateScratch), sCLayX{})(1));*/
+    /*print_tensor(make_tensor(cute::make_smem_ptr(gateScratch), sCLay2{}));
+    printf("t(1): %f\n", make_tensor(cute::make_smem_ptr(gateScratch), sCLay2{})(1));
+    print_tensor(make_tensor(cute::make_smem_ptr(gateScratch), sCLay2X{}));
+    printf("t(1): %f\n", make_tensor(cute::make_smem_ptr(gateScratch), sCLay2X{})(1));*/
+}
+
+int main() {
+    hostSc();
 }

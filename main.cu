@@ -619,9 +619,11 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         cute::Underscore{},
         threadIdx.x,
         CAST_TO(char, scratch));
+#if 1
     __syncthreads();
 
     // Epilogue
+
     auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
     auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
 
@@ -637,6 +639,10 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     constexpr auto trips = size(accum) / elems;
     // Leverage compiler packing for half-precision values into one register
     cutlass::AlignedArray<ElementD, elems> rScratch{};
+
+    constexpr auto sCLay = make_layout(cute::Shape<cute::_128, cute::_64>{});
+    auto sC = make_tensor(cute::make_smem_ptr(scratch), sCLay);
+    auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
 
     // Prefetch from global to shared memory
     CUTE_UNROLL
@@ -668,8 +674,9 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         __threadfence_system();
     }
     __syncthreads();
+#endif
 
-#if 0
+#if 1
     if (cute::thread0()) {
         cute::print_tensor(mD);
         cute::print_tensor(mA);
@@ -678,13 +685,31 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     }
 #endif
 #if 0
-    /*if (threadIdx.x == 0) {
+    if (cute::thread0) {
+        printf("gC(0, 1): %f, gC(1, 0): %f,\nmC(0, 1): %f, mC(1, 0): %f, p[1]: %f\n",
+            cute::half_t::convert(gC(0, 1)),
+            cute::half_t::convert(gC(1, 0)),
+            cute::half_t::convert(mC(0, 1)),
+            cute::half_t::convert(mC(1, 0)),
+            cute::half_t::convert(gC.data()[1]));
+        printf("sC(0): %.2f, sC(0, 1): %f, sC(1, 0): %f,\nsCratch[0]: %f, sCratch[1]: %f, size(sC): %u\n",
+            cute::half_t::convert(sC(0, 0)),
+            cute::half_t::convert(sC(0, 1)),
+            cute::half_t::convert(sC(1, 0)),
+            cute::half_t::convert(scratch[0]),
+            cute::half_t::convert(scratch[1]),
+            cute::size<1>(sC.layout()));
+    }
+#endif
+
+#if 0
+    if (threadIdx.x == 0) {
         // Signal that this tile is available
         atomicAdd(&syncP, 1);
         // Wait until all tiles are ready.
         while (atomicCAS(&syncP, 0U, 0U) % kChunks != 0){}
     }
-    __syncthreads();*/
+    __syncthreads();
 
     // Clear accumulator registers in preparation
     cute::clear(accum);
@@ -1082,7 +1107,6 @@ void golfing() {
                           + cublasdx::Function<cublasdx::function::MM>()
                           + cublasdx::SM<800>()
                           + cublasdx::Block());
-
     testSharedCopy<GEMM, inputValueType, weightValueType, outValueType><<<1,1>>>();
     CUTE_CHECK_LAST();
 }
@@ -1497,6 +1521,87 @@ __global__ void expBench() {
     printf("t(1): %f\n", make_tensor(cute::make_smem_ptr(gateScratch), sCLay2X{})(1));*/
 }
 
+__device__ __forceinline__
+bool isLikelyRegister(void* p) {
+    return !(__isShared(p) &&
+        __isLocal(p) &&
+        __isConstant(p) &&
+        __isGlobal(p) &&
+        __isGridConstant(p));
+}
+
+template<typename BlockMM>
+__global__ __maxnreg__(128) void regPair() {
+    cutlass::AlignedArray<cuda::std::pair<float, unsigned int>, 32> f{};
+    #pragma unroll
+    for (int i = 0; i < f.size(); ++i) {
+        const bool isRegister = !(__isShared(f.data() + i) &&
+        __isLocal(f.data() + i) &&
+        __isConstant(f.data() + i) &&
+        __isGlobal(f.data() + i) &&
+        __isGridConstant(f.data() + i));
+        assert(isRegister);
+    }
+    assert(isLikelyRegister(&blockIdx.x));
+    constexpr auto t = BlockMM::block_dim.x;
+    static_assert(BlockMM::block_dim.x == 128);
+}
+
+struct FooBarrier {
+    cuda::barrier<cuda::thread_scope_device>* deviceBarrier;
+    CUTE_HOST_DEVICE
+    FooBarrier() = default;
+
+    CUTE_HOST
+    explicit FooBarrier(cuda::barrier<cuda::thread_scope_device>* _deviceBarrier):
+    deviceBarrier(_deviceBarrier){}
+};
+
+__constant__ FooBarrier fDevice;
+template<unsigned int blocks>
+__global__ void gridBarrier(cuda::barrier<cuda::thread_scope_device>* deviceBarrier, bool skip = true) {
+    float d = 0.0f;
+    constexpr auto rounds = 64;
+    for (unsigned int i = 0; i < rounds; ++i) {
+        size_t start = 0, end = 0;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        if (!threadIdx.x) {
+            if ((atomicAdd(q, 1U) + 1) % blocks == 0) {
+                atomicAdd(q + 1, 1U);
+            }
+            while (atomicOr(q + 1, 0U) != i + 1){}
+        }
+        __syncthreads();
+        /*if (!threadIdx.x) {
+            fDevice.deviceBarrier->arrive_and_wait();
+        }
+        __syncthreads();*/
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        d += static_cast<float>(end - start) / static_cast<float>(rounds);
+    }
+    if (!skip && !threadIdx.x) {
+        printf("Block %u says Blockade takes: %f and q is %u\n", blockIdx.x, d, *q);
+    }
+}
+
+void hostB() {
+    CUTE_CHECK_ERROR(cudaSetDevice(1));
+    constexpr std::array<unsigned int, 2> qHost{{0U, 0U}};
+    CUTE_CHECK_ERROR(cudaMemcpyToSymbol(q, qHost.data(), qHost.size()*sizeof(unsigned int)));
+    const auto host_b = new cuda::barrier<cuda::thread_scope_device>{256};
+    cuda::barrier<cuda::thread_scope_device>* b;
+    CUTE_CHECK_ERROR(cudaMalloc(&b, sizeof(cuda::barrier<cuda::thread_scope_device>)));
+    CUTE_CHECK_LAST();
+    CUTE_CHECK_ERROR(cudaMemcpy(b, host_b, sizeof(cuda::barrier<cuda::thread_scope_device>), cudaMemcpyHostToDevice));
+    CUTE_CHECK_LAST();
+
+    const auto f = FooBarrier(b);
+    CUTE_CHECK_ERROR(cudaMemcpyToSymbol(fDevice, &f, sizeof(cuda::barrier<cuda::thread_scope_device>)));
+    gridBarrier<256><<<256, 128>>>(b, false);
+    CUTE_CHECK_LAST();
+    delete host_b;
+}
 int main() {
-    hostSc();
+    testCollective();
+    CUTE_CHECK_LAST();
 }

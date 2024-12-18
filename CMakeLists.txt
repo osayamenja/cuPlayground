@@ -41,7 +41,13 @@ set(CAFFE2_USE_CUDNN ON)
 
 add_executable(cuPlayground main.cu
         processor/gemm.cuh
-        processor/tiling.cuh)
+        processor/tiling.cuh
+        examples/overlap.cuh
+        util.cuh
+        mma.cuh
+        debug.cuh
+        benchmarks.cuh
+)
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
         CUDA_SEPARABLE_COMPILATION ON

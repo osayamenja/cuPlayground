@@ -291,4 +291,37 @@ struct CollectiveMMAConfig{
     cutlass::gemm::MainloopSm70TwoStageUnpredicated,
     cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>>;
 };
+
+template<typename ElementA, typename ElementB, typename ElementC, unsigned int Arch>
+struct ProcessorGEMM {
+    using BlockMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, BLOCK_K_FULL>()
+                          + cublasdx::Precision<toCDX<ElementA>, toCDX<ElementB>, toCDX<ElementC>>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<Arch>()
+                          + cublasdx::Block()
+                          + cublasdx::BlockDim<THREADS>());
+    using blockTiler = cute::Shape<cute::Int<cublasdx::size_of<BlockMM>::m>,
+                                    cute::Int<cublasdx::size_of<BlockMM>::n>,
+                                    cute::Int<cublasdx::size_of<BlockMM>::k>>;
+    using Parameters = CollectiveMMAConfig<BlockMM, LayoutOptimization::UseSwizzle>;
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        typename Parameters::dispatch,
+        blockTiler,
+        ElementA,
+        cute::Underscore,
+        ElementB,
+        cute::Underscore,
+        typename Parameters::mma_t,
+        typename Parameters::gCopyA,
+        typename Parameters::sLayA,
+        typename Parameters::sCopyA,
+        cute::identity,
+        typename Parameters::gCopyB,
+        typename Parameters::sLayB,
+        typename Parameters::sCopyB,
+        cute::identity
+    >;
+};
 #endif //TILING_CUH

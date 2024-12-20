@@ -47,6 +47,7 @@ add_executable(cuPlayground main.cu
         mma.cuh
         debug.cuh
         benchmarks.cuh
+        examples/pipelining.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
@@ -81,16 +82,6 @@ CPMAddPackage(
 )
 if(FMT_ADDED)
     target_include_directories(cuPlayground SYSTEM PRIVATE "${FMT_SOURCE_DIR}/include")
-endif ()
-
-CPMAddPackage(
-        NAME SPDLOG
-        GITHUB_REPOSITORY gabime/spdlog
-        VERSION 1.14.1
-        OPTIONS "SPDLOG_FMT_EXTERNAL 1"
-)
-if(SPDLOG_ADDED)
-    target_link_libraries(cuPlayground PRIVATE spdlog::spdlog)
 endif ()
 
 set(NvidiaCutlass_ROOT "$ENV{CUTLASS_PATH}")
@@ -146,8 +137,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(cuPlayground PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
-            $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-            $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -O3>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=lto_${COMPUTE_CAPABILITY}>
     )
 endif ()

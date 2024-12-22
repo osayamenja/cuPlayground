@@ -33,8 +33,8 @@ template<
 >
 requires (processorCount > 0 && scratchSize > 0 && regSize >= 32 &&
         scratchSize >= regSize && scratchSize % regSize == 0)
-__global__ __maxnreg__(128) void fastScheduler(unsigned int* __restrict__ rQ,
-    unsigned int* __restrict__ pDB,
+__global__ __maxnreg__(128) void fastScheduler(unsigned int* __restrict__ const& rQ,
+    unsigned int* __restrict__ const& pDB,
     const __grid_constant__ unsigned int bound) {
     __shared__ __align__(16) unsigned int scratch[scratchSize];
     cutlass::AlignedArray<unsigned int, regSize> registerScratch;

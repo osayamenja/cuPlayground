@@ -59,6 +59,7 @@ string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # 
 #target_precompile_headers(cuPlayground PRIVATE torchInclude.h)
 #target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
 #CPM
+# set(ENV{CPM_USE_NAMED_CACHE_DIRECTORIES} ON)
 set(ENV{CPM_USE_LOCAL_PACKAGES} ON)
 set(ENV{CPM_SOURCE_CACHE} "./cmake/cache")
 include(cmake/CPM.cmake)
@@ -74,6 +75,20 @@ if(CCCL_ADDED)
     target_link_libraries(cuPlayground PRIVATE CCCL::CCCL)
 endif()
 
+#CUTLASS business
+CPMAddPackage(
+        NAME CUTLASS
+        GITHUB_REPOSITORY nvidia/cutlass
+        GIT_TAG main
+        DOWNLOAD_ONLY TRUE
+        OPTIONS
+        "CUTLASS_NVCC_ARCHS=${COMPUTE_CAPABILITY}"
+)
+if(CUTLASS_ADDED)
+    # header-only
+    target_include_directories(cuPlayground SYSTEM PRIVATE "${CUTLASS_SOURCE_DIR}/include")
+endif ()
+
 CPMAddPackage(
         NAME FMT
         GITHUB_REPOSITORY fmtlib/fmt
@@ -84,8 +99,8 @@ if(FMT_ADDED)
     target_include_directories(cuPlayground SYSTEM PRIVATE "${FMT_SOURCE_DIR}/include")
 endif ()
 
-set(NvidiaCutlass_ROOT "$ENV{CUTLASS_PATH}")
-set(mathdx_CUTLASS_ROOT "$ENV{CUTLASS_PATH}")
+set(NvidiaCutlass_ROOT "${CUTLASS_SOURCE_DIR}")
+set(mathdx_CUTLASS_ROOT "${CUTLASS_SOURCE_DIR}")
 
 set(MATHDX_VER 24.08)
 set(MATHDX_URL_PREFIX "https://developer.download.nvidia.com/compute/cublasdx/redist/cublasdx")

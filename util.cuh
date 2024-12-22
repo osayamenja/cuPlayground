@@ -59,4 +59,12 @@ void printType() {
     // Free the memory allocated by abi::__cxa_demangle
     free(demangledName);
 }
+
+template<typename V>
+    concept TensorValueType = cuda::std::is_same_v<V, cute::half_t> ||
+        cuda::std::is_same_v<V, cute::bfloat16_t> ||
+        cuda::std::is_same_v<V, cute::tfloat32_t> ||
+        cuda::std::is_same_v<V, float> ||
+        cuda::std::is_same_v<V, cute::float_e4m3_t> ||
+        cuda::std::is_same_v<V, cute::float_e5m2_t>;
 #endif //UTIL_CUH

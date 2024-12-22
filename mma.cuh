@@ -7,9 +7,11 @@
 
 #include <cuda/std/type_traits>
 #include <cublasdx.hpp>
+#include <cute/tensor.hpp>
 #include <cutlass/epilogue/thread/activation.h>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/collective/collective_mma.hpp>
+
 #include "processor/tiling.cuh"
 #include "util.cuh"
 
@@ -57,12 +59,12 @@ auto fusedAddActivate(cute::bfloat16_t& accumulator, const cute::bfloat16_t& ter
 
 
 void __global__ benchFAA() {
-    auto val = 0.5_hf;
+    auto val = cute::half_t(0.5f);
     __shared__ cute::half_t bias;
-    bias = -0.3_hf;
+    bias = -cute::half_t(0.3f);
     cutlass::epilogue::thread::ReLU<cute::half_t> op {};
     double devFAATime = 0.0, vanillaFAATime = 0.0;
-    CUTE_UNROLL
+    #pragma unroll
     for (int i = 0; i < 1024; ++i) {
         uint64_t start = 0, end = 0;
         asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
@@ -81,13 +83,10 @@ void __global__ benchFAA() {
     printf("Device: %f, Vanilla: %f", devFAATime, vanillaFAATime);
 }
 
-template<typename Acc>
-requires (cute::is_tensor_v<Acc> && cute::is_rmem_v<Acc>)
-using golf = cute::Int<2>;
 // <=96 registers: <= 5 blocks
 template<class BlockMM, typename ActivationOp = cute::identity,
 unsigned int sharedSize = 16 * 1024,
-typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD,
+typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD, typename MatrixS,
 typename MatrixAx, typename MatrixBx, typename MatrixCx, typename MatrixDx,
 typename ElementA = toCT<typename BlockMM::a_value_type>,
 typename ElementB = toCT<typename BlockMM::b_value_type>,
@@ -96,6 +95,7 @@ requires (cute::is_tensor_v<MatrixA>
     && cute::is_tensor_v<MatrixB>
     && cute::is_tensor_v<MatrixC>
     && cute::is_tensor_v<MatrixD>
+    && cute::is_tensor_v<MatrixS>
     && cute::is_tensor_v<MatrixAx>
     && cute::is_tensor_v<MatrixBx>
     && cute::is_tensor_v<MatrixCx>
@@ -107,8 +107,8 @@ requires (cute::is_tensor_v<MatrixA>
     && cublasdx::is_supported<BlockMM, cublasdx::sm_of<BlockMM>::value>::value
     && cublasdx::sm_of<BlockMM>::value >= MIN_ARCH
     && sharedSize % THREADS == 0)
-__global__ __maxnreg__(128) void deviceCollectiveMMA(
-    const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD,
+__global__ __maxnreg__(96) void deviceCollectiveMMA(
+    const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD, const MatrixS mS,
     const MatrixAx mAx, const MatrixBx mBx, const MatrixCx mCx, const MatrixDx mDx) {
     static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
     static_assert(rank(mAx) == 2 && rank(mBx) == 2 && rank(mCx) == 2 && rank(mDx) == 2);
@@ -116,33 +116,11 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     constexpr auto bM = cublasdx::size_of<BlockMM>::m;
     constexpr auto bN = cublasdx::size_of<BlockMM>::n;
     constexpr auto bK = cublasdx::size_of<BlockMM>::k;
-    // put in constant memory
-    const unsigned int kChunks = cute::ceil_div(cute::get<1>(mC.shape()), bN);
-
     using blockTiler = cute::Shape<cute::Int<bM>, cute::Int<bN>, cute::Int<bK>>;
-
-    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        typename Parameters::dispatch,
-        blockTiler,
-        ElementA,
-        cute::Underscore,
-        ElementB,
-        cute::Underscore,
-        typename Parameters::mma_t,
-        typename Parameters::gCopyA,
-        typename Parameters::sLayA,
-        typename Parameters::sCopyA,
-        cute::identity,
-        typename Parameters::gCopyB,
-        typename Parameters::sLayB,
-        typename Parameters::sCopyB,
-        cute::identity
-    >;
 
     typename Parameters::mma_t tiledMMA;
     using TilerOut = cute::Shape<cute::Int<bM>, cute::Int<bN>>;
     auto accum = cute::partition_fragment_C(tiledMMA, TilerOut{});
-    constexpr auto gg = golf<decltype(accum)>::value;
     static_assert(cuda::std::is_same_v<ElementC, typename decltype(accum)::value_type>);
     cute::clear(accum);
 
@@ -150,13 +128,14 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     // use problem shape instead, p_MNK = (cute::ceil_div(M, bM), cute::ceil_div(N, bN), K)
     //auto M = cute::get<0>(mC.shape());
     //auto N = cute::get<1>(mC.shape());
-    auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(cute::ceil_div(cute::get<0>(mC.shape()), bM),
+    const auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(cute::ceil_div(cute::get<0>(mC.shape()), bM),
         cute::ceil_div(cute::get<1>(mC.shape()), bN)));
-    auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
-    auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
-    auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
-    auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
-    auto gD = local_tile(mD, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+    const auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
+    const auto gA = local_tile(mA, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
+    const auto gB = local_tile(mB, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
+    const auto gC = local_tile(mC, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+    const auto gD = local_tile(mD, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+    const auto gS = local_tile(mS, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});
 
     auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
     int k_tile_count = size<2>(gA);
@@ -174,17 +153,18 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         threadIdx.x,
         CAST_TO(char, scratch));
 #if 1
-    __syncthreads();
 
     // Epilogue
 
-    auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
-    auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
-
+    const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
+    const auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
+    const auto tSgS = tiledMMA.get_slice(threadIdx.x).partition_C(gS);
+    
     // Accounts for GEMMs that accumulate in types differing from input types,
     // given that the result moonlights as the input for the succeeding GEMM.
-    auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, ElementC>{};
-    auto gDLoadOp = cutlass::NumericConverter<ElementC, ElementD>{};
+    constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, ElementC>{};
+    constexpr auto gDLoadOp = cutlass::NumericConverter<ElementC, ElementD>{};
+    constexpr auto ScaleOp = cutlass::epilogue::thread::Scale<ElementC>{};
 
     // Assume unary operator
     ActivationOp epilogueOp{};
@@ -194,47 +174,52 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     // Leverage compiler packing for half-precision values into one register
     cutlass::AlignedArray<ElementD, elems> rScratch{};
 
-    constexpr auto sCLay = make_layout(cute::Shape<cute::_128, cute::_64>{});
-    auto sC = make_tensor(cute::make_smem_ptr(scratch), sCLay);
-    auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
-
-    // Prefetch from global to shared memory
-    CUTE_UNROLL
-    for (int j = 0; j < elems; ++j) {
-        scratch[threadIdx.x + j * THREADS] = tDgD(j);
-    }
-
-    CUTE_UNROLL
+    #pragma unroll
     for (int i = 0; i < trips; ++i) {
-        CUTE_UNROLL
+        // Prefetch from global to shared memory
+        #pragma unroll
+        for (int j = 0; j < elems; ++j) {
+            scratch[threadIdx.x + j * THREADS] = tDgD(j);
+        }
+
+        #pragma unroll
         for (int j = 0; j < elems; ++j) {
             rScratch[j] = scratch[threadIdx.x + j * THREADS];
-            if (i + 1 < trips) {
+            /*if (i + 1 < trips) {
                 // Eagerly start loads for the next batch
-                scratch[threadIdx.x + j * THREADS] = tDgD(j + i * elems);
-            }
+                scratch[threadIdx.x + j * THREADS] = tDgD(j + (i + 1) * elems);
+            }*/
+            scratch[threadIdx.x + j * THREADS] = tSgS(j + i * elems);
         }
+
         // Fused Bias Add and Activation Function on register fragment
         // Also fuses copy to GMEM
-        CUTE_UNROLL
+        #pragma unroll
         for (int j = 0; j < elems; ++j) {
-            tCgC(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
+            accum(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
                 gDLoadOp(rScratch[j]), epilogueOp));
+            rScratch[j] = scratch[threadIdx.x + j * THREADS];
+        }
+
+        // Do scale
+        #pragma unroll
+        for (int j = 0; j < elems; ++j) {
+            tCgC(j + i * elems) = ScaleOp(accum(j + i * elems), gDLoadOp(rScratch[j]));
         }
     }
 
     __syncthreads();
     if (!threadIdx.x) {
-        __threadfence_system();
+        __threadfence();
     }
-    __syncthreads();
 #endif
 
-#if 1
+#if 0
     if (cute::thread0()) {
         cute::print_tensor(mD);
         cute::print_tensor(mA);
         cute::print_tensor(mB);
+        cute::print_tensor(mS);
         cute::print_tensor(mC);
     }
 #endif
@@ -283,15 +268,15 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
     tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
 
-    CUTE_UNROLL
+    #pragma unroll
     for (int i = 0; i < trips; ++i) {
         // Prefetch
-        CUTE_UNROLL
+        #pragma unroll
         for (int j = 0; j < elems; ++j) {
             rScratch[j] = gDLoadOp(tDgD(j + i * elems));
         }
         // Fused Bias Add on register fragment
-        CUTE_UNROLL
+        #pragma unroll
         for (int j = 0; j < elems; ++j) {
             tCgC(j + i * elems) = gCStoreOp(accum(j + i * elems) + rScratch[j]);
         }
@@ -325,7 +310,6 @@ void testCollective() {
     using weightValueType = cute::half_t;
     using accumulateType = float;
 
-    // Do y=xA^T
     using GEMM = decltype(cublasdx::Size<bM, bN, bK>()
                           + cublasdx::Precision<toCDX<inputValueType>, toCDX<weightValueType>, accumulateType>()
                           + cublasdx::Type<cublasdx::type::real>()
@@ -366,26 +350,28 @@ void testCollective() {
 
     CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, len, cudaMemcpyHostToDevice, playStream));
 
-    auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)),
+    const auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
-    auto mB = make_tensor(cute::make_gmem_ptr(
+    const auto mB = make_tensor(cute::make_gmem_ptr(
         CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
-    auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
+    const auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
 
     // bias vector (1, N) broadcast to (M, N)
-    auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
+    const auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
+    const auto mS = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
+                make_layout(cute::make_shape(M, N), cute::make_stride(1, 0)));
 
     // Second GEMM
-    auto mAx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
+    const auto mAx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
-    auto mBx = make_tensor(cute::make_gmem_ptr(
+    const auto mBx = make_tensor(cute::make_gmem_ptr(
         CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(K, N), cute::make_stride(N, 1)));
-    auto mCx = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)),
+    const auto mCx = make_tensor(cute::make_gmem_ptr(CAST_TO(outValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
 
-    auto mDx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
+    const auto mDx = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, K), cute::make_stride(0, 1)));
 
     constexpr auto gemmSharedSize = (sizeof(inputValueType) * GEMM::a_size)
@@ -393,8 +379,7 @@ void testCollective() {
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 32 * 4);
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
     deviceCollectiveMMA<GEMM, activation><<<1, 128, sharedSize, playStream>>>
-    (mA, mB, mC, mD,
-        mAx, mBx, mCx, mDx);
+    (mA, mB, mC, mD, mS, mAx, mBx, mCx, mDx);
     CUTE_CHECK_LAST();
     CUTE_CHECK_ERROR(cudaFree(abc));
     free(data);

@@ -9,6 +9,8 @@
 #include <cuda/std/type_traits>
 #include <cute/arch/copy.hpp>
 #include <cute/arch/copy_sm80.hpp>
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/collective/collective_mma.hpp>
 
 // GEMM configuration constants
 #define MIN_ARCH 700
@@ -309,6 +311,48 @@ struct ProcessorGEMM {
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
         typename Parameters::dispatch,
         blockTiler,
+        ElementA,
+        cute::Underscore,
+        ElementB,
+        cute::Underscore,
+        typename Parameters::mma_t,
+        typename Parameters::gCopyA,
+        typename Parameters::sLayA,
+        typename Parameters::sCopyA,
+        cute::identity,
+        typename Parameters::gCopyB,
+        typename Parameters::sLayB,
+        typename Parameters::sCopyB,
+        cute::identity
+    >;
+};
+
+template<typename ElementA, typename ElementB, typename ElementC, unsigned int Arch>
+struct BlockMM {
+    static_assert(BLOCK_M == THREADS);
+    static_assert(BLOCK_M == 128);
+    static_assert(BLOCK_N == 64, "64 is a very good value for N, change it back!");
+    using GEMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, BLOCK_K_FULL>()
+                          + cublasdx::Precision<toCDX<ElementA>, toCDX<ElementB>, toCDX<ElementC>>()
+                          + cublasdx::Type<cublasdx::type::real>()
+                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major, cublasdx::row_major>()
+                          + cublasdx::Function<cublasdx::function::MM>()
+                          + cublasdx::SM<Arch>()
+                          + cublasdx::Block()
+                          + cublasdx::BlockDim<THREADS>());
+    using MatrixAType = ElementA;
+    using MatrixBType = ElementB;
+    using MatrixCType = ElementC;
+    using MatrixDType = ElementA;
+    using BlockTiler = cute::Shape<cute::Int<cublasdx::size_of<GEMM>::m>,
+                                    cute::Int<cublasdx::size_of<GEMM>::n>,
+                                    cute::Int<cublasdx::size_of<GEMM>::k>>;
+    using TilerOut = cute::Shape<cute::Int<cublasdx::size_of<GEMM>::m>, cute::Int<cublasdx::size_of<GEMM>::n>>;
+    using Parameters = CollectiveMMAConfig<GEMM, LayoutOptimization::UseSwizzle>;
+    using MMA = typename Parameters::mma_t;
+    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
+        typename Parameters::dispatch,
+        BlockTiler,
         ElementA,
         cute::Underscore,
         ElementB,

@@ -42,12 +42,13 @@ set(CAFFE2_USE_CUDNN ON)
 add_executable(cuPlayground main.cu
         processor/gemm.cuh
         processor/tiling.cuh
-        examples/overlap.cuh
+        auditorium/overlap.cuh
         util.cuh
         mma.cuh
         debug.cuh
         benchmarks.cuh
-        examples/pipelining.cuh
+        auditorium/pipelining.cuh
+        auditorium/combine.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
@@ -117,7 +118,8 @@ target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 target_link_libraries(cuPlayground PRIVATE nvshmem::nvshmem)
 
-if(DEFINED ENV{NERSC_HOST})
+set(LINK_NCCL ON)
+if(DEFINED ENV{NERSC_HOST} AND ${LINK_NCCL})
     find_library(NCCL
             NAMES libnccl_static.a
             HINTS "$ENV{NCCL_HOME}"

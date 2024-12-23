@@ -8,7 +8,9 @@
 #include <typeinfo>
 #include <cxxabi.h>
 #include <cuda_runtime.h>
+#include <cuda/std/type_traits>
 
+#define SHARED_SIZE 16 * 1024U
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define BYTE_CAST(p) static_cast<cuda::std::byte*>(static_cast<void*>(p))
 #define NANO_TO_MICRO (cuda::std::nano::den / cuda::std::micro::den)
@@ -67,4 +69,24 @@ template<typename V>
         cuda::std::is_same_v<V, float> ||
         cuda::std::is_same_v<V, cute::float_e4m3_t> ||
         cuda::std::is_same_v<V, cute::float_e5m2_t>;
+
+template<typename T>
+    using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
+            __half,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::bfloat16_t>,
+        __nv_bfloat16,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e4m3_t>,
+        __nv_fp8_e4m3,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e5m2_t>,
+        __nv_fp8_e5m2, T>>>>;
+
+template<typename T>
+using toCT = cuda::std::conditional_t<cuda::std::is_same_v<T, __half>,
+        cute::half_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_bfloat16>,
+        cute::bfloat16_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e4m3>,
+        cute::float_e4m3_t,
+    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e5m2>,
+        cute::float_e5m2_t, T>>>>;
 #endif //UTIL_CUH

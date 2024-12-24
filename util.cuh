@@ -89,4 +89,7 @@ using toCT = cuda::std::conditional_t<cuda::std::is_same_v<T, __half>,
         cute::float_e4m3_t,
     cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e5m2>,
         cute::float_e5m2_t, T>>>>;
+
+template<unsigned int Arch>
+concept SupportedArch = Arch >= 700 && Arch <= 900;
 #endif //UTIL_CUH

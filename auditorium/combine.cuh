@@ -39,13 +39,15 @@ template<unsigned int Arch, typename Element = float>
 requires SupportedArch<Arch> && TensorValueType<Element>
 struct VAA {
     template<class Registers>
-    requires isRegisterV<Registers> &&
-        cuda::std::is_same_v<typename Registers::value_type, Element>
+    requires isRegisterV<Registers>
     __device__ __forceinline__
     void operator()(Element* __restrict__ const& gS, Registers registers) const {
+        // Float is the "safe accumulator type"
+        // We acknowledge this by converting registers to float before accumulating.
+        auto regLoadOp = cutlass::NumericConverter<float, typename Registers::value_type>{};
         #pragma unroll
         for (uint i = 0; i < registers.size(); ++i) {
-            atomicAdd(gS + i, registers(i));
+            atomicAdd(gS + i, regLoadOp(registers(i)));
         }
     }
 };
@@ -109,7 +111,16 @@ struct VAA<900, float> {
     }
 };
 
-template<unsigned Arch> requires SupportedArch<Arch>
+enum class CombineMode {
+    single,
+    multithreaded
+};
+
+template<
+    unsigned Arch,
+    typename ElementCombine,
+    CombineMode c = CombineMode::single
+> requires SupportedArch<Arch> && TensorValueType<ElementCombine>
 struct Combine {
     template<
         class Activations,
@@ -158,7 +169,6 @@ struct Combine {
         // Transposed layout
         constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
         const auto sC = cute::make_tensor(cute::make_smem_ptr(workspace), sCLay);
-        constexpr VAA<Arch, Element> vaa{};
 
         #pragma unroll
         for (uint i = 0; i < trips; ++i) {
@@ -177,7 +187,21 @@ struct Combine {
         }
 
         if (threadIdx.x < tileSize) {
-            vaa(&activations(tokenIdx, 0), registers);
+            if constexpr (c == CombineMode::multithreaded) {
+                // do conversion to float before combining
+                constexpr VAA<Arch, ElementCombine> vaa{};
+                vaa(&activations(tokenIdx, 0), registers);
+            }
+            else {
+                // vector copy from registers to global directly
+                constexpr auto vL = registers.size() * sizeof(Element) / sizeof(uint4);
+                auto* __restrict__ aP = CAST_TO(uint4, &activations(tokenIdx, 0));
+                const auto* __restrict__ rD = CAST_TO(uint4, registers.data());
+                #pragma unroll
+                for (uint i = 0; i < vL; ++i) {
+                    aP[i] = rD[i];
+                }
+            }
         }
     }
 };
@@ -193,11 +217,9 @@ __global__ __maxnreg__(128) void deviceCombine(cuda::std::byte* __restrict__ p) 
         cute::make_gmem_ptr(CAST_TO(Element, p + sizeof(unsigned int) * M + sizeof(Element) * M * N)),
         make_layout(cute::make_shape(M, N), cute::LayoutRight{}));
     static_assert(cuda::std::is_same_v<typename decltype(activations)::value_type, Element>);
-    constexpr Combine<800> combineOp{};
     extern __shared__ __align__(16) Element scratch[];
     cutlass::AlignedArray<Element, BLOCK_N> regs{};
-    cutlass::AlignedArray<cute::half_t, BLOCK_N> r{};
-    cuda::std::array<cute::bfloat16_t, BLOCK_N> rr{};
+    constexpr Combine<800, Element> combineOp{};
     combineOp(scratch, tokenIndices, regs, inputs, activations, M, N, blockIdx.x, M);
     /*__syncthreads();
     if (!threadIdx.x) {

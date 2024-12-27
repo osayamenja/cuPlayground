@@ -1,10 +1,9 @@
 //
-// Created by oja7 on 12/18/24.
+// Created by oja7 on 12/24/24.
 //
 
-#ifndef MMA_CUH
-#define MMA_CUH
-
+#ifndef SCALEDMMA_CUH
+#define SCALEDMMA_CUH
 #include <cuda/std/type_traits>
 #include <cublasdx.hpp>
 #include <cute/tensor.hpp>
@@ -15,7 +14,6 @@
 #include "processor/tiling.cuh"
 #include "util.cuh"
 
-// <=96 registers: <= 5 blocks
 template<class BlockMM, typename ActivationOp = cute::identity,
 unsigned int sharedSize = 16 * 1024,
 typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD, typename MatrixS,
@@ -89,11 +87,13 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
     const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
     const auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
-    
+    const auto tSgS = tiledMMA.get_slice(threadIdx.x).partition_C(gS);
+
     // Accounts for GEMMs that accumulate in types differing from input types,
     // given that the result moonlights as the input for the succeeding GEMM.
     constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(tCgC)::value_type, ElementC>{};
     constexpr auto gDLoadOp = cutlass::NumericConverter<ElementC, ElementD>{};
+    constexpr auto ScaleOp = cutlass::epilogue::thread::Scale<ElementC>{};
 
     // Assume unary operator
     ActivationOp epilogueOp{};
@@ -103,27 +103,37 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     // Leverage compiler packing for half-precision values into one register
     cutlass::AlignedArray<ElementD, elems> rScratch{};
 
-    // Prefetch from global to shared memory
     #pragma unroll
-    for (int j = 0; j < elems; ++j) {
-        scratch[threadIdx.x + j * THREADS] = tDgD(j);
-    }
-
-    #pragma unroll
-    for (unsigned int i = 0; i < trips; ++i) {
-    #pragma unroll
-        for (unsigned int j = 0; j < elems; ++j) {
-            rScratch[j] = scratch[threadIdx.x + j * THREADS];
-            if (i + 1 < trips) {
-                // Eagerly start loads for the next batch, if needed
-                scratch[threadIdx.x + j * THREADS] = tDgD(j + (i + 1) * elems);
-            }
-        }
-        // Fused Bias Add and Activation Function on register fragment
-        // Also fuses copy to GMEM.
+    for (int i = 0; i < trips; ++i) {
+        // Prefetch from global to shared memory
         #pragma unroll
         for (int j = 0; j < elems; ++j) {
-            tCgC(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),gDLoadOp(rScratch[j]), epilogueOp));
+            scratch[threadIdx.x + j * THREADS] = tDgD(j);
+        }
+
+        #pragma unroll
+        for (int j = 0; j < elems; ++j) {
+            rScratch[j] = scratch[threadIdx.x + j * THREADS];
+            /*if (i + 1 < trips) {
+                // Eagerly start loads for the next batch
+                scratch[threadIdx.x + j * THREADS] = tDgD(j + (i + 1) * elems);
+            }*/
+            scratch[threadIdx.x + j * THREADS] = tSgS(j + i * elems);
+        }
+
+        // Fused Bias Add and Activation Function on register fragment
+        // Also fuses copy to GMEM
+        #pragma unroll
+        for (int j = 0; j < elems; ++j) {
+            accum(j + i * elems) = gCStoreOp(fusedAddActivate(accum(j + i * elems),
+                gDLoadOp(rScratch[j]), epilogueOp));
+            rScratch[j] = scratch[threadIdx.x + j * THREADS];
+        }
+
+        // Do scale
+        #pragma unroll
+        for (int j = 0; j < elems; ++j) {
+            tCgC(j + i * elems) = ScaleOp(accum(j + i * elems), gDLoadOp(rScratch[j]));
         }
     }
 
@@ -131,86 +141,6 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     if (!threadIdx.x) {
         __threadfence();
     }
-
-#if 0
-    if (cute::thread0()) {
-        cute::print_tensor(mD);
-        cute::print_tensor(mA);
-        cute::print_tensor(mB);
-        cute::print_tensor(mS);
-        cute::print_tensor(mC);
-    }
-#endif
-#if 0
-    if (cute::thread0) {
-        printf("gC(0, 1): %f, gC(1, 0): %f,\nmC(0, 1): %f, mC(1, 0): %f, p[1]: %f\n",
-            cute::half_t::convert(gC(0, 1)),
-            cute::half_t::convert(gC(1, 0)),
-            cute::half_t::convert(mC(0, 1)),
-            cute::half_t::convert(mC(1, 0)),
-            cute::half_t::convert(gC.data()[1]));
-        printf("sC(0): %.2f, sC(0, 1): %f, sC(1, 0): %f,\nsCratch[0]: %f, sCratch[1]: %f, size(sC): %u\n",
-            cute::half_t::convert(sC(0, 0)),
-            cute::half_t::convert(sC(0, 1)),
-            cute::half_t::convert(sC(1, 0)),
-            cute::half_t::convert(scratch[0]),
-            cute::half_t::convert(scratch[1]),
-            cute::size<1>(sC.layout()));
-    }
-#endif
-
-#if 0
-    // Clear accumulator registers in preparation
-    cute::clear(accum);
-
-    gA = local_tile(mAx, blockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
-    gB = local_tile(mBx, blockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
-    gC = local_tile(mCx, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
-    gD = local_tile(mDx, blockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
-
-    auto k_tile_iterX = cute::make_coord_iterator(size<2>(gA));
-    k_tile_count = size<2>(gA);
-
-    // Execute next GEMM now
-    collective_mma(
-        accum,
-        gA,
-        gB,
-        accum,
-        k_tile_iterX, k_tile_count,
-        cute::Underscore{},
-        threadIdx.x,
-        CAST_TO(char, scratch));
-
-    // Epilogue
-    tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
-    tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
-
-    #pragma unroll
-    for (int i = 0; i < trips; ++i) {
-        // Prefetch
-        #pragma unroll
-        for (int j = 0; j < elems; ++j) {
-            rScratch[j] = gDLoadOp(tDgD(j + i * elems));
-        }
-        // Fused Bias Add on register fragment
-        #pragma unroll
-        for (int j = 0; j < elems; ++j) {
-            tCgC(j + i * elems) = gCStoreOp(accum(j + i * elems) + rScratch[j]);
-        }
-    }
-    __threadfence(); // Ensures writes are visible device-wide
-    __syncthreads();
-#endif
-    // Signal publisher
-#if 0
-    if (cute::thread0()) {
-        cute::print_tensor(mAx);
-        cute::print_tensor(mBx);
-        cute::print_tensor(mDx);
-        cute::print_tensor(mCx);
-    }
-#endif
 }
 
 __host__ __forceinline__
@@ -266,7 +196,7 @@ void testCollective() {
     mBHost(1, 0) = static_cast<weightValueType>(6.0);
     mBHost(1, 1) = static_cast<weightValueType>(7.0);
 
-    CUTE_CHECK_ERROR(cudaMemcpyAsync(abc, data, len, cudaMemcpyHostToDevice, playStream));
+    CHECK_ERROR_EXIT(cudaMemcpyAsync(abc, data, len, cudaMemcpyHostToDevice, playStream));
 
     const auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
@@ -298,9 +228,8 @@ void testCollective() {
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
     deviceCollectiveMMA<GEMM, activation><<<1, 128, sharedSize, playStream>>>
     (mA, mB, mC, mD, mS, mAx, mBx, mCx, mDx);
-    CUTE_CHECK_LAST();
-    CUTE_CHECK_ERROR(cudaFree(abc));
+    CHECK_LAST();
+    CHECK_ERROR_EXIT(cudaFree(abc));
     free(data);
 }
-
-#endif //MMA_CUH
+#endif //SCALEDMMA_CUH

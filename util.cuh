@@ -9,6 +9,7 @@
 #include <cxxabi.h>
 #include <cuda_runtime.h>
 #include <cuda/std/type_traits>
+#include <cuda/atomic>
 
 #define SHARED_SIZE 16 * 1024U
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
@@ -92,4 +93,61 @@ using toCT = cuda::std::conditional_t<cuda::std::is_same_v<T, __half>,
 
 template<unsigned int Arch>
 concept SupportedArch = Arch >= 700 && Arch <= 900;
+
+/// A more apropos name would be "static storage" rather than registers.
+template<class T>
+struct isRegister : cuda::std::false_type {};
+
+template<class T, int N, int Alignment>
+struct isRegister<cutlass::AlignedArray<T, N, Alignment>> : cuda::std::true_type {};
+
+template<class T, int N, bool RegisterSized>
+struct isRegister<cutlass::Array<T, N, RegisterSized>> : cuda::std::true_type {};
+
+template<class Engine, class Layout>
+struct isRegister<cute::Tensor<Engine, Layout>> :
+cuda::std::conditional_t<cute::is_rmem_v<cute::Tensor<Engine, Layout>>,
+cuda::std::true_type, cuda::std::false_type> {};
+
+template <class T>
+constexpr bool isRegisterV = isRegister<T>::value;
+
+template<typename B>
+    concept AtomicType = cuda::std::same_as<B, int> || cuda::std::same_as<B, unsigned int>
+    || cuda::std::same_as<B, unsigned long long int>;
+
+template<typename B>
+concept AtomicCASType = cuda::std::same_as<B, int> || cuda::std::same_as<B, unsigned int>
+|| cuda::std::same_as<B, unsigned long long int> || cuda::std::same_as<B, unsigned short int>;
+
+template<cuda::thread_scope scope>
+concept AtomicScope = scope == cuda::thread_scope_thread ||
+    scope == cuda::thread_scope_block || scope == cuda::thread_scope_device || scope == cuda::thread_scope_system;
+
+template<cuda::thread_scope scope = cuda::thread_scope_device, typename T>
+requires AtomicType<T> && AtomicScope<scope>
+__device__ __forceinline__
+T atomicLoad(T* const& addr){
+    if constexpr (scope == cuda::thread_scope_block || scope == cuda::thread_scope_thread) {
+        return atomicOr_block(addr, 0U);
+    }
+    if constexpr (scope == cuda::thread_scope_system) {
+        return atomicOr_system(addr, 0U);
+    }
+    return atomicOr(addr, 0U);
+}
+
+template<cuda::thread_scope scope = cuda::thread_scope_device,
+    unsigned int bound = cuda::std::numeric_limits<unsigned int>::max()>
+    requires(AtomicScope<scope> && bound <= cuda::std::numeric_limits<unsigned int>::max())
+    __device__ __forceinline__
+    unsigned int atomicIncrement(unsigned int* const& addr) {
+    if constexpr (scope == cuda::thread_scope_block || scope == cuda::thread_scope_thread) {
+        return atomicInc_block(addr, bound);
+    }
+    if constexpr (scope == cuda::thread_scope_system) {
+        return atomicInc_system(addr, bound);
+    }
+    return atomicInc(addr, bound);
+}
 #endif //UTIL_CUH

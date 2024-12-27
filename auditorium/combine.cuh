@@ -16,24 +16,6 @@
 #include "../util.cuh"
 #include "../processor/tiling.cuh"
 
-/// A more apropos name would be "static storage" rather than registers.
-template<class T>
-struct isRegister : cuda::std::false_type {};
-
-template<class T, int N, int Alignment>
-struct isRegister<cutlass::AlignedArray<T, N, Alignment>> : cuda::std::true_type {};
-
-template<class T, int N, bool RegisterSized>
-struct isRegister<cutlass::Array<T, N, RegisterSized>> : cuda::std::true_type {};
-
-template<class Engine, class Layout>
-struct isRegister<cute::Tensor<Engine, Layout>> :
-cuda::std::conditional_t<cute::is_rmem_v<cute::Tensor<Engine, Layout>>,
-cuda::std::true_type, cuda::std::false_type> {};
-
-template <class T>
-constexpr bool isRegisterV = isRegister<T>::value;
-
 // Vector atomic add
 template<unsigned int Arch, typename Element = float>
 requires SupportedArch<Arch> && TensorValueType<Element>

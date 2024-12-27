@@ -49,6 +49,8 @@ add_executable(cuPlayground main.cu
         benchmarks.cuh
         auditorium/pipelining.cuh
         auditorium/combine.cuh
+        scaledMMA.cuh
+        auditorium/scheduling.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON

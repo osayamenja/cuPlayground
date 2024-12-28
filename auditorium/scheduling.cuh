@@ -9,16 +9,18 @@
 #include <cutlass/array.h>
 #include "../util.cuh"
 
-template<unsigned int processorCount, typename Registers>
-requires(processorCount > 0 && isRegisterV<Registers>)
+template<unsigned int processorCount, typename Registers, typename RScratch>
+requires(processorCount > 0 && isRegisterV<Registers> && isRegisterV<RScratch>
+    && cuda::std::is_same_v<typename RScratch::value_type, unsigned short int>)
 __device__ __forceinline__
 void scheduleLoop(unsigned int& tasks,
     unsigned int& scheduled,
     const unsigned int& wSIdx,
     Registers& rtQTails,
+    RScratch& rQSet,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned int* __restrict__ const& rQ,
+    const unsigned short int* __restrict__ const& rQ,
     const unsigned int& tQRow,
     const unsigned int& tQRl,
     unsigned int* __restrict__ const& pDB) {
@@ -27,31 +29,50 @@ void scheduleLoop(unsigned int& tasks,
         auto tasksToSchedule = cute::min(readyProcesses, tasks);
         tasks -= tasksToSchedule;
         scheduled += tasksToSchedule;
-        while (tasksToSchedule) {
-            // read pid from shared memory directly
-            // batching to registers would be a pain to write :)
-            const auto pid = rQ[rQTail++ % processorCount];
-            --tasksToSchedule;
+        constexpr auto batchSize = RScratch::kElements;
+        const auto tSb = tasksToSchedule / batchSize; // tasks to schedule batches
+        for (uint i = 0; i < tSb; ++i) {
+            #pragma unroll
+            for (uint j = 0; j < batchSize; ++j) {
+                rQSet[j] = rQ[rQTail++ % processorCount];
+            }
+
+            #pragma unroll
+            for (uint j = 0; j < batchSize; ++j) {
+                const auto pid = rQSet[j];
+                ++rtQTails[wSIdx];
+                atomicExch(pDB + pid, tQRow * tQRl + rtQTails[wSIdx]);
+            }
+        }
+        const auto residue = tasksToSchedule - tSb * batchSize;
+        for (uint i = 0; i < residue; ++i) {
+            rQSet[i] = rQ[rQTail++ % processorCount];
+        }
+
+        for (uint i = 0; i < residue; ++i) {
+            const auto pid = rQSet[i];
             ++rtQTails[wSIdx];
-            // postfix index to differentiate from the sentinel signal; recipients deduct 1 before use
             atomicExch(pDB + pid, tQRow * tQRl + rtQTails[wSIdx]);
         }
     }
 }
 
 // all loops are unrolled
-template<unsigned int processorCount, unsigned int producerCount, unsigned int wSetSize, typename Registers>
+template<unsigned int processorCount, unsigned int producerCount, unsigned int wSetSize,
+typename Registers, typename RScratch>
 requires(processorCount > 0 && producerCount > 0 && producerCount < 128 && wSetSize > 1 && wSetSize % 4 == 0
-    && isRegisterV<Registers> && Registers::kElements == wSetSize)
+    && isRegisterV<Registers> && Registers::kElements == wSetSize
+    && isRegisterV<RScratch> && RScratch::kElements == wSetSize)
 __device__ __forceinline__
 void staticSchedule(unsigned int& scheduled,
     Registers& rtQTails,
+    RScratch& rQSet,
     const unsigned int& tQRl,
     unsigned int* __restrict__ const& tQTails,
     unsigned int* __restrict__ const& tQHeads,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned int* __restrict__ const& rQ,
+    const unsigned short int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB) {
     constexpr auto producerBatches = producerCount / wSetSize;
 
@@ -67,7 +88,7 @@ void staticSchedule(unsigned int& scheduled,
             const auto tQRow = j + i * wSetSize;
             auto tasks = atomicLoad<cuda::thread_scope_block>(tQHeads + tQRow) - rtQTails[j];
             // Let's schedule these tasks
-            scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQHead,
+            scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQSet, rQHead,
                 rQTail, rQ, tQRow, tQRl, pDB);
         }
 
@@ -89,7 +110,7 @@ void staticSchedule(unsigned int& scheduled,
     for (uint j = 0; j < residue; ++j) {
         const auto tQRow = j + producerBatches * wSetSize;
         auto tasks = atomicLoad<cuda::thread_scope_block>(tQHeads + tQRow) - rtQTails[j];
-        scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQHead,
+        scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQSet, rQHead,
                 rQTail, rQ, tQRow, tQRl, pDB);
     }
 
@@ -101,18 +122,20 @@ void staticSchedule(unsigned int& scheduled,
 }
 
 // dynamic trip, used for external task queue whose heads are in global memory not shared.
-template<unsigned int processorCount, unsigned int wSetSize, typename Registers>
+template<unsigned int processorCount, unsigned int wSetSize, typename Registers, typename RScratch>
 requires(processorCount > 0 && wSetSize > 1 && wSetSize % 4 == 0
-    && isRegisterV<Registers> && Registers::kElements == wSetSize)
+    && isRegisterV<Registers> && Registers::kElements == wSetSize
+    && isRegisterV<RScratch> && RScratch::kElements == wSetSize)
 __device__ __forceinline__
 void dynamicSchedule(unsigned int& scheduled,
     Registers& rtQTails,
+    RScratch& rQSet,
     const unsigned int& tQRl,
     unsigned int* __restrict__ const& tQTails,
     unsigned int* __restrict__ const& tQHeads,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned int* __restrict__ const& rQ,
+    const unsigned short int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB,
     const unsigned int& taskMailboxes) {
     const auto mailboxBatches = taskMailboxes / wSetSize;
@@ -128,7 +151,7 @@ void dynamicSchedule(unsigned int& scheduled,
             const auto tQRow = j + i * wSetSize;
             auto tasks = atomicLoad(tQHeads + tQRow) - rtQTails[j];
             // Let's schedule these tasks
-            scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQHead,
+            scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQSet, rQHead,
                 rQTail, rQ, tQRow, tQRl, pDB);
         }
 
@@ -147,7 +170,7 @@ void dynamicSchedule(unsigned int& scheduled,
     for (uint j = 0; j < residue; ++j) {
         const auto tQRow = j + mailboxBatches * wSetSize;
         auto tasks = atomicLoad(tQHeads + tQRow) - rtQTails[j];
-        scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQHead,
+        scheduleLoop<processorCount>(tasks, scheduled, j, rtQTails, rQSet, rQHead,
                 rQTail, rQ, tQRow, tQRl, pDB);
     }
 
@@ -169,41 +192,23 @@ void schedulerStart(const unsigned int& tQRl,
     unsigned int* __restrict__ const& tQTails,
     unsigned int* __restrict__ const& taskBound,
     unsigned int* __restrict__ const& rQHead,
-    const unsigned int* __restrict__ const& rQ,
+    const unsigned short int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB) {
     // assert(__isShared(all arguments above) and alignment is 16)
     unsigned int scheduled = 0U;
     unsigned int rQTail = 0U;
     constexpr auto wSetSize = 64;
+    constexpr auto rQSetSize = 64;
     cutlass::AlignedArray<unsigned int, wSetSize> rtQTails{};
-
-    constexpr auto sB = 16;
-    static_assert(sB % 4 == 0);
-    const auto batches = gtQCL / sB;
-
+    cutlass::AlignedArray<unsigned short int, rQSetSize> rQSet{};
     rtQTails.fill(0U);
-    // memset
-    #pragma unroll
-    for (uint i = 0; i < producerCount; ++i) {
-        tQTails[i] = 0U;
-    }
-
-    for (uint i = 0; i < batches; ++i) {
-        #pragma unroll
-        for (uint j = 0; j < sB; ++j) {
-            tQTails[j] = 0U;
-        }
-    }
-    for (uint i = batches * sB; i < gtQCL; ++i) {
-        tQTails[i] = 0U;
-    }
 
     while (scheduled < atomicLoad<cuda::thread_scope_block>(taskBound)) {
         // sweep all static wQHeads and schedule pending tasks
-        staticSchedule<processorCount, producerCount, wSetSize>(scheduled, rtQTails, tQRl, tQTails,
+        staticSchedule<processorCount, producerCount, wSetSize>(scheduled, rtQTails, rQSet, tQRl, tQTails,
             tQHeads, rQHead, rQTail, rQ, pDB);
         // Now do dynamic scheduling
-        dynamicSchedule<processorCount, wSetSize>(scheduled, rtQTails, gtQRl, gtQTails,
+        dynamicSchedule<processorCount, wSetSize>(scheduled, rtQTails, rQSet, gtQRl, gtQTails,
             gtQHeads, rQHead, rQTail, rQ, pDB, gtQCL);
     }
 }

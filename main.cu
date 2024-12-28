@@ -4,7 +4,6 @@
 #include "auditorium/scheduling.cuh"
 
 __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const bool skip = true) {
-    __shared__ __align__(16) cuda::std::byte scratch [3000];
     constexpr auto processorCount = 4 * 108U;
     constexpr auto producerCount = 126;
 
@@ -20,6 +19,9 @@ __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const boo
     constexpr auto gtQCl = M / bM;
     constexpr auto gtQRl = N / bN;
 
+    constexpr auto sharedSize = (2 + 2 * producerCount + gtQCl + processorCount) * sizeof(unsigned int);
+    __shared__ __align__(16) cuda::std::byte scratch [sharedSize];
+
     auto* __restrict__ taskBound = CAST_TO(unsigned int, scratch);
     *taskBound = fTB + sTB;
     auto* __restrict__ tQHeads = taskBound + 1;
@@ -29,6 +31,8 @@ __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const boo
         tQHeads[i] = fTB / producerCount;
         constexpr auto residue = fTB - fTB / producerCount * producerCount;
         tQHeads[i] += static_cast<unsigned int>(i < residue);
+        // clear state
+        tQTails[i] = 0U;
     }
     #pragma unroll
     for (uint i = threadIdx.x; i < gtQCl; i += blockDim.x) {
@@ -38,11 +42,18 @@ __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const boo
     auto* __restrict__ gTQTails = tQTails + producerCount;
     auto* __restrict__ rQHead = gTQTails + gtQCl;
     *rQHead = fTB + sTB; // this is actually cheating
-    const auto* __restrict__ rQ = rQHead + 1;
+    // max pid << USHORT_INT_MAX
+    const auto* __restrict__ rQ = CAST_TO(unsigned short int, rQHead + 1);
     #pragma unroll
     for (uint i = threadIdx.x; i < processorCount; i += blockDim.x) {
         // done this way to preserve the const attribute of rQ
-        (rQHead + 1)[i] = i;
+        (rQHead + 1)[i] = static_cast<unsigned short int>(i);
+    }
+
+    #pragma unroll
+    for (uint i = threadIdx.x; i < gtQCl; i += blockDim.x) {
+        // clear state
+        gTQTails[i] = 0U;
     }
 
     __syncthreads();
@@ -52,8 +63,8 @@ __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const boo
         schedulerStart<processorCount, producerCount>(tQRl, gtQCl, gtQRl,
                 tQHeads, p, gTQTails, tQTails, taskBound, rQHead, rQ, p + gtQCl);
         asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-        if (!skip) {
-            printf("Time taken is : %fus\n", static_cast<float>(end - start) / 1000.0f);
+        if(!skip) {
+            printf("Time taken is %fus\n", static_cast<float>(end - start) / 1000.0f);
         }
     }
 }
@@ -67,15 +78,12 @@ int main() {
     constexpr auto gtQCl = M / bM;
 
     unsigned int* p;
-    CHECK_ERROR_EXIT(cudaMalloc(&p, (processorCount + gtQCl) * sizeof(unsigned int)));
-    #pragma unroll
-    for (uint i = 0; i < 1; ++i) {
-        theatre<<<1, 64>>>(p);
-        CHECK_LAST();
-        printf("Weird...\n");
+    CHECK_ERROR_EXIT(cudaMallocAsync(&p, (processorCount + gtQCl) * sizeof(unsigned int), cudaStreamPerThread));
+    for (uint i = 0; i < 256; ++i) {
+        theatre<<<1, 256, 0, cudaStreamPerThread>>>(p);
     }
-    theatre<<<1, 64>>>(p, false);
-    CHECK_ERROR_EXIT(cudaFree(p));
+    theatre<<<1, 256, 0, cudaStreamPerThread>>>(p, false);
+    CHECK_ERROR_EXIT(cudaFreeAsync(p, cudaStreamPerThread));
     CHECK_LAST();
     //hostCombine();
 }

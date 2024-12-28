@@ -1,49 +1,81 @@
 #include <cuda/std/cstddef>
-#include "auditorium/combine.cuh"
+#include <cute/int_tuple.hpp>
+#include "util.cuh"
+#include "auditorium/scheduling.cuh"
 
-using SignalStruct = cuda::std::pair<unsigned int, ushort2>;
-__device__ __forceinline__
-// buffer is an 8-byte array, which we split into
-// 4-byte integer denoting batch index
-// 2 bytes denoting blockM dimension
-// 2 bytes identifying the communication stage
-void encodeSignal(cuda::std::byte* __restrict__ const& buffer, const SignalStruct& s) {
-    // assert(__isShared(buffer));
-    *CAST_TO(SignalStruct, buffer) = s;
+__global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const bool skip = true) {
+    __shared__ __align__(16) cuda::std::byte scratch [3000];
+    constexpr auto processorCount = 4 * 108U;
+    constexpr auto producerCount = 126;
+
+    constexpr auto M = 8192U;
+    constexpr auto N = 4096U;
+    constexpr auto Nx = 4096U;
+    constexpr auto bM = 128U;
+    constexpr auto bN = 64U;
+
+    constexpr auto fTB = M / bM * (Nx / bN);
+    constexpr auto sTB = M / bM * (N / bN);
+    constexpr auto tQRl = cute::ceil_div(fTB, producerCount);
+    constexpr auto gtQCl = M / bM;
+    constexpr auto gtQRl = N / bN;
+
+    auto* __restrict__ taskBound = CAST_TO(unsigned int, scratch);
+    *taskBound = fTB + sTB;
+    auto* __restrict__ tQHeads = taskBound + 1;
+    auto* __restrict__ tQTails = tQHeads + producerCount;
+    #pragma unroll
+    for (uint i = threadIdx.x; i < producerCount; i += blockDim.x) {
+        tQHeads[i] = fTB / producerCount;
+        constexpr auto residue = fTB - fTB / producerCount * producerCount;
+        tQHeads[i] += static_cast<unsigned int>(i < residue);
+    }
+    #pragma unroll
+    for (uint i = threadIdx.x; i < gtQCl; i += blockDim.x) {
+        p[i] = gtQRl;
+    }
+
+    auto* __restrict__ gTQTails = tQTails + producerCount;
+    auto* __restrict__ rQHead = gTQTails + gtQCl;
+    *rQHead = fTB + sTB; // this is actually cheating
+    const auto* __restrict__ rQ = rQHead + 1;
+    #pragma unroll
+    for (uint i = threadIdx.x; i < processorCount; i += blockDim.x) {
+        // done this way to preserve the const attribute of rQ
+        (rQHead + 1)[i] = i;
+    }
+
+    __syncthreads();
+    if (!threadIdx.x) {
+        uint64_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+        schedulerStart<processorCount, producerCount>(tQRl, gtQCl, gtQRl,
+                tQHeads, p, gTQTails, tQTails, taskBound, rQHead, rQ, p + gtQCl);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        if (!skip) {
+            printf("Time taken is : %fus\n", static_cast<float>(end - start) / 1000.0f);
+        }
+    }
 }
 
-__device__ __forceinline__
-auto decodeSignal(cuda::std::byte* __restrict__ const& buffer) {
-    return *CAST_TO(SignalStruct, buffer);
-}
-
-__global__ void packetSignal() {
-    extern __shared__ cuda::std::byte packetScratch[];
-    constexpr auto s = SignalStruct{2, ushort2{128, 1}};
-    encodeSignal(packetScratch, s);
-    printf("Encode(bI = 2, bM = 128, s = 1) -> %lu\n", *CAST_TO(uint64_t, packetScratch));
-    const auto signal = decodeSignal(packetScratch);
-    printf("Decode -> bI: %u, bM: %u, s : %u", signal.first, signal.second.x, signal.second.y);
-}
-
-template<typename R>
-requires isRegisterV<R>
-__device__ __forceinline__
-void encore(R &r) {
-    static_assert(R::kElements == 32);
-    r[0] = uint2{45, 89};
-}
-
-__global__ void theatre() {
-    cutlass::AlignedArray<uint2, 32> a{};
-    printf("Before, a[0].x: %u\n", a[0].x);
-    encore(a);
-    printf("After, a[0].x: %u", a[0].x);
-}
 
 int main() {
-    //packetSignal<<<1, 1, 8, cudaStreamPerThread>>>();
-    theatre<<<1,1>>>();
+    constexpr auto M = 8192U;
+    constexpr auto bM = 128U;
+
+    constexpr auto processorCount = 4 * 108U;
+    constexpr auto gtQCl = M / bM;
+
+    unsigned int* p;
+    CHECK_ERROR_EXIT(cudaMalloc(&p, (processorCount + gtQCl) * sizeof(unsigned int)));
+    #pragma unroll
+    for (uint i = 0; i < 1; ++i) {
+        theatre<<<1, 64>>>(p);
+        CHECK_LAST();
+        printf("Weird...\n");
+    }
+    theatre<<<1, 64>>>(p, false);
+    CHECK_ERROR_EXIT(cudaFree(p));
     CHECK_LAST();
     //hostCombine();
 }

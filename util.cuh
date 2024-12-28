@@ -9,7 +9,9 @@
 #include <cxxabi.h>
 #include <cuda_runtime.h>
 #include <cuda/std/type_traits>
+#include <cuda/std/concepts>
 #include <cuda/atomic>
+#include <cute/tensor.hpp>
 
 #define SHARED_SIZE 16 * 1024U
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
@@ -127,7 +129,7 @@ concept AtomicScope = scope == cuda::thread_scope_thread ||
 template<cuda::thread_scope scope = cuda::thread_scope_device, typename T>
 requires AtomicType<T> && AtomicScope<scope>
 __device__ __forceinline__
-T atomicLoad(T* const& addr){
+T atomicLoad(T* __restrict__ const& addr){
     if constexpr (scope == cuda::thread_scope_block || scope == cuda::thread_scope_thread) {
         return atomicOr_block(addr, 0U);
     }
@@ -141,7 +143,7 @@ template<cuda::thread_scope scope = cuda::thread_scope_device,
     unsigned int bound = cuda::std::numeric_limits<unsigned int>::max()>
     requires(AtomicScope<scope> && bound <= cuda::std::numeric_limits<unsigned int>::max())
     __device__ __forceinline__
-    unsigned int atomicIncrement(unsigned int* const& addr) {
+    unsigned int atomicIncrement(unsigned int* __restrict__ const& addr) {
     if constexpr (scope == cuda::thread_scope_block || scope == cuda::thread_scope_thread) {
         return atomicInc_block(addr, bound);
     }

@@ -42,12 +42,11 @@ __global__ __maxnreg__(128) void theatre(unsigned int* __restrict__ p, const boo
     auto* __restrict__ gTQTails = tQTails + producerCount;
     auto* __restrict__ rQHead = gTQTails + gtQCl;
     *rQHead = fTB + sTB; // this is actually cheating
-    // max pid << USHORT_INT_MAX
-    const auto* __restrict__ rQ = CAST_TO(unsigned short int, rQHead + 1);
+    const auto* __restrict__ rQ = rQHead + 1;
     #pragma unroll
     for (uint i = threadIdx.x; i < processorCount; i += blockDim.x) {
         // done this way to preserve the const attribute of rQ
-        (rQHead + 1)[i] = static_cast<unsigned short int>(i);
+        (rQHead + 1)[i] = i;
     }
 
     #pragma unroll

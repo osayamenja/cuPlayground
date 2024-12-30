@@ -5,13 +5,13 @@
 #ifndef SCHEDULING_CUH
 #define SCHEDULING_CUH
 
+#include <cuda/std/array>
 #include <cute/numeric/math.hpp>
 #include <cutlass/array.h>
 #include "../util.cuh"
 
 template<unsigned int processorCount, typename Registers, typename RScratch>
-requires(processorCount > 0 && isRegisterV<Registers> && isRegisterV<RScratch>
-    && cuda::std::is_same_v<typename RScratch::value_type, unsigned short int>)
+requires(processorCount > 0 && isRegisterV<Registers> && isRegisterV<RScratch>)
 __device__ __forceinline__
 void scheduleLoop(unsigned int& tasks,
     unsigned int& scheduled,
@@ -20,15 +20,19 @@ void scheduleLoop(unsigned int& tasks,
     RScratch& rQSet,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned short int* __restrict__ const& rQ,
+    const unsigned int* __restrict__ const& rQ,
     const unsigned int& tQRow,
     const unsigned int& tQRl,
     unsigned int* __restrict__ const& pDB) {
     while (tasks) {
         const auto readyProcesses = atomicLoad<cuda::thread_scope_block>(rQHead) - rQTail;
-        auto tasksToSchedule = cute::min(readyProcesses, tasks);
+        const auto tasksToSchedule = cute::min(readyProcesses, tasks);
         tasks -= tasksToSchedule;
         scheduled += tasksToSchedule;
+        if (tasksToSchedule) {
+            // ensures reads to ready Q happen after signal reception
+            __threadfence_block();
+        }
         constexpr auto batchSize = RScratch::kElements;
         const auto tSb = tasksToSchedule / batchSize; // tasks to schedule batches
         for (uint i = 0; i < tSb; ++i) {
@@ -52,6 +56,7 @@ void scheduleLoop(unsigned int& tasks,
         for (uint i = 0; i < residue; ++i) {
             const auto pid = rQSet[i];
             ++rtQTails[wSIdx];
+            // Fence is not needed prior to signal given task producers already issue one.
             atomicExch(pDB + pid, tQRow * tQRl + rtQTails[wSIdx]);
         }
     }
@@ -62,7 +67,7 @@ template<unsigned int processorCount, unsigned int producerCount, unsigned int w
 typename Registers, typename RScratch>
 requires(processorCount > 0 && producerCount > 0 && producerCount < 128 && wSetSize > 1 && wSetSize % 4 == 0
     && isRegisterV<Registers> && Registers::kElements == wSetSize
-    && isRegisterV<RScratch> && RScratch::kElements == wSetSize)
+    && isRegisterV<RScratch>)
 __device__ __forceinline__
 void staticSchedule(unsigned int& scheduled,
     Registers& rtQTails,
@@ -72,7 +77,7 @@ void staticSchedule(unsigned int& scheduled,
     unsigned int* __restrict__ const& tQHeads,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned short int* __restrict__ const& rQ,
+    const unsigned int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB) {
     constexpr auto producerBatches = producerCount / wSetSize;
 
@@ -125,7 +130,7 @@ void staticSchedule(unsigned int& scheduled,
 template<unsigned int processorCount, unsigned int wSetSize, typename Registers, typename RScratch>
 requires(processorCount > 0 && wSetSize > 1 && wSetSize % 4 == 0
     && isRegisterV<Registers> && Registers::kElements == wSetSize
-    && isRegisterV<RScratch> && RScratch::kElements == wSetSize)
+    && isRegisterV<RScratch>)
 __device__ __forceinline__
 void dynamicSchedule(unsigned int& scheduled,
     Registers& rtQTails,
@@ -135,9 +140,9 @@ void dynamicSchedule(unsigned int& scheduled,
     unsigned int* __restrict__ const& tQHeads,
     unsigned int* __restrict__ const& rQHead,
     unsigned int& rQTail,
-    const unsigned short int* __restrict__ const& rQ,
+    const unsigned int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB,
-    const unsigned int& taskMailboxes) {
+    unsigned int const& taskMailboxes) {
     const auto mailboxBatches = taskMailboxes / wSetSize;
 
     for (uint i = 0; i < mailboxBatches; ++i) {
@@ -192,15 +197,15 @@ void schedulerStart(const unsigned int& tQRl,
     unsigned int* __restrict__ const& tQTails,
     unsigned int* __restrict__ const& taskBound,
     unsigned int* __restrict__ const& rQHead,
-    const unsigned short int* __restrict__ const& rQ,
+    const unsigned int* __restrict__ const& rQ,
     unsigned int* __restrict__ const& pDB) {
     // assert(__isShared(all arguments above) and alignment is 16)
     unsigned int scheduled = 0U;
     unsigned int rQTail = 0U;
-    constexpr auto wSetSize = 64;
-    constexpr auto rQSetSize = 64;
+    constexpr auto wSetSize = 16;
+    constexpr auto rQSetSize = 16;
     cutlass::AlignedArray<unsigned int, wSetSize> rtQTails{};
-    cutlass::AlignedArray<unsigned short int, rQSetSize> rQSet{};
+    cutlass::AlignedArray<unsigned int, rQSetSize> rQSet{};
     rtQTails.fill(0U);
 
     while (scheduled < atomicLoad<cuda::thread_scope_block>(taskBound)) {

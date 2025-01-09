@@ -7,6 +7,7 @@
 
 #include <array>
 
+#include <cuda/std/tuple>
 #include <cooperative_groups/memcpy_async.h>
 #include <cuda/barrier>
 #include <cute/tensor.hpp>
@@ -390,6 +391,7 @@ __global__ __maxnreg__(128) void atoEx(unsigned int* p) {
     }
 }
 
+__host__ __forceinline__
 void atoExHost() {
     void* p;
     constexpr std::array<unsigned int, 400> arr{};
@@ -462,6 +464,8 @@ __global__ void testAtomicMax() {
         }
     }
 }
+
+__host__ __forceinline__
 void hostAMax() {
     auto* p = calloc(N_FOO, sizeof(unsigned long int));
     // Sets foo to zero

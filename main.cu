@@ -5,14 +5,12 @@
 #include <cuda/std/functional>
 #include <cuda/std/__algorithm/make_heap.h>
 #include <cuda/std/__algorithm/pop_heap.h>
-#include <cuda/std/__algorithm/partial_sort.h>
 #include <cuda/std/array>
 #include <cute/tensor.hpp>
-#include <cutlass/array.h>
 #include "util.cuh"
 
 using V = float;
-using HT = cuda::std::pair<V, uint>;
+using HT = cuda::std::pair<uint, uint>;
 
 template<unsigned int n, typename T>
 __device__ __forceinline__
@@ -43,10 +41,11 @@ void selectionSort(T* __restrict__ const& a) {
         cuda::std::swap(a[jM], a[i]);
     }
 }
-/*__global__ void theatre(const bool skip = true) {
+
+__global__ void theatre(const bool skip = true) {
     constexpr auto k = 4U;
-    cuda::std::array<V, k> heap{};
-    __shared__ V sHeap[k];
+    cuda::std::array<HT, k> heap{};
+    __shared__ HT sHeap[k];
     #pragma unroll
     for (uint i = 0; i < k; ++i) {
         sHeap[i] = HT{k, i};
@@ -59,109 +58,104 @@ void selectionSort(T* __restrict__ const& a) {
     // print_tensor(heapT); printf("\n");
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
     make_heap(sHeap, sHeap + k, cuda::std::greater{});
+    pop_heap(sHeap, sHeap + k, cuda::std::greater{});
     #pragma unroll
     for (uint i = 0; i < 64 - k; ++i) {
-        pop_heap(sHeap, sHeap + k, cuda::std::greater{});
         push_heap(sHeap, sHeap + k, cuda::std::greater{});
+        pop_heap(sHeap, sHeap + k, cuda::std::greater{});
     }
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
     sC = static_cast<float>(end - start);
-
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
     make_heap(heap.begin(), heap.end(), cuda::std::greater{});
+    pop_heap(heap.begin(), heap.end(), cuda::std::greater{});
     #pragma unroll
     for (uint i = 0; i < 64 - k; ++i) {
-        pop_heap(heap.begin(), heap.end(), cuda::std::greater{});
         push_heap(heap.begin(), heap.end(), cuda::std::greater{});
+        pop_heap(heap.begin(), heap.end(), cuda::std::greater{});
     }
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
     lC = static_cast<float>(end - start);
-
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
     asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
     qC = static_cast<float>(end - start);
     if (!skip) {
         printf("sC is %f, lC is %f, qC is %f", sC, lC, qC);
-        cuda::std::array<uint, 4> a{4, 3, 2, 1};
-        const auto t = make_tensor(a.data(), cute::Layout<cute::Shape<cute::_1, cute::_4>,
-            cute::Stride<cute::_4, cute::_1>>{});
-        print_tensor(t); printf("\n");
-        selectionSort<4>(a.data());
-        print_tensor(t); printf("\n");
     }
-}*/
 
-__global__ void stage(float* __restrict__ p, const bool skip = true) {
+}
+#define TIMING 1
+
+__global__ void stage(const float init, uint* __restrict__ p, const bool skip = true) {
     constexpr auto k = 64U;
-    constexpr auto ik = 2U;
-    cuda::std::array<float, k> heap{};
-    __shared__ bool checked[k];
-    __shared__ uint indices[ik];
+    constexpr auto ik = 1U;
+    cutlass::AlignedArray<float, k> heap{};
+    cutlass::AlignedArray<uint8_t, k> rC{};
+    __shared__ __align__(16) uint8_t checked[k];
+    __shared__ __align__(16) uint8_t indices[ik];
     #pragma unroll
     for (uint i = 0; i < k; ++i) {
-        heap[i] = p[i];
+        heap[i] = init - static_cast<float>(i);
+        checked[i] = 0U;
     }
-
     auto ii = 0U;
+#if TIMING
+    uint64_t start = 0, end = 0;
+    double iC = 0.0f;
+    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+#endif
+
     #pragma unroll
     for (uint i = 0; i < ik; ++i) {
         auto v = -cuda::std::numeric_limits<V>::infinity();
-        auto idx = 0U;
+        uint idx = 0U;
         #pragma unroll
         for (uint j = 0; j < k; ++j) {
-            if (heap[j] > v && !checked[j]) {
+            rC[j] = checked[j];
+        }
+        #pragma unroll
+        for (uint j = 0; j < k; ++j) {
+            if (heap[j] > v && !rC[j]) {
                 idx = j;
                 v = heap[j];
             }
         }
-        checked[idx] = true;
+        checked[idx] = 1U;
         indices[ii++] = idx;
     }
-    p[127] = static_cast<float>(indices[ik - 1]);
-    /*uint64_t start = 0, end = 0;
-    float iC = 0.0f;
-    float sC = 0.0f;*/
-    /*asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);*/
-    //insertionSort<k>(heap.data());
-    /*asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    iC = static_cast<float>(end - start);*/
-    /*#pragma unroll
-    for (uint i = 0; i < k; ++i) {
-        p[i] = heap[i];
-    }*/
-    /*#pragma unroll
-    for (uint i = 0; i < k; ++i) {
-        heap[i] = p[k + i];
+#if TIMING
+    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+    iC = static_cast<double>(end - start);
+    if (!skip) {
+        printf("iC is %f\n", iC);
     }
-    /*asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);#1#
-    selectionSort<k>(heap.data());
-    /*asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    sC = static_cast<float>(end - start);#1#
-    #pragma unroll
-    for (uint i = 0; i < k; ++i) {
-        p[k + i] = heap[i];
-    }*/
-    /*if (!skip) {
-        printf("sC is %f, iC is %f\n", sC, iC);
-    }*/
+#endif
+    p[ik - 1] = indices[ik - 1];
 }
 
 __host__ __forceinline__
 void hostTheatre() {
-    /*for (uint i = 0; i < 128; ++i) {
-        stage<<<1,1>>>();
-    }*/
-    constexpr auto k = 64U;
-    cuda::std::array<V, k> heap{};
-    for (uint i = 0; i < k; ++i) {
-        heap[i] = static_cast<float>(k - i);
+    for (uint i = 0; i < 128; ++i) {
+        theatre<<<1,1>>>();
     }
-    float* p;
-    CHECK_ERROR_EXIT(cudaMalloc(&p, 2 * k * sizeof(float)));
-    CHECK_ERROR_EXIT(cudaMemcpy(p, heap.data(), 2 * k * sizeof(float), cudaMemcpyHostToDevice));
-    stage<<<1,1>>>(p);
+    theatre<<<1,1>>>(false);
+    CUTE_CHECK_LAST();
+}
+
+__host__ __forceinline__
+void hostStage() {
+    // use volatile to deactivate compiler optimizations
+    const volatile float k = 64.f;
+    uint* p;
+    CHECK_ERROR_EXIT(cudaMalloc(&p, 2 * k * sizeof(uint)));
+#if TIMING
+    for (uint i = 0; i < 128; ++i) {
+        stage<<<1,1>>>(k, p);
+    }
+#endif
+    stage<<<1,1>>>(k, p, false);
     CUTE_CHECK_LAST();
 }
 int main() {
-    hostTheatre();
+    hostStage();
 }

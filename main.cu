@@ -1,161 +1,78 @@
-/*#include <nvshmemx.h>
-#include <nvshmem.h>
-#include <host/nvshmemx_api.h> // Makes CLion happy*/
+#include <array>
 
-#include <cuda/std/functional>
-#include <cuda/std/__algorithm/make_heap.h>
-#include <cuda/std/__algorithm/pop_heap.h>
-#include <cuda/std/array>
-#include <cute/tensor.hpp>
+#include <cub/cub.cuh>
+#include <cutlass/array.h>
+
 #include "util.cuh"
+#include "fmt/args.h"
 
-using V = float;
-using HT = cuda::std::pair<uint, uint>;
-
-template<unsigned int n, typename T>
-__device__ __forceinline__
-void insertionSort(T* __restrict__ const& a) {
-    #pragma unroll
-    for (uint i = 1; i < n; ++i) {
-        #pragma unroll
-        for (uint j = i; j > 0; --j) {
-            if (a[j - 1] > a[j]) {
-                cuda::std::swap(a[j - 1], a[j]);
-            }
-        }
-    }
-}
-
-template<unsigned int n, typename T>
-__device__ __forceinline__
-void selectionSort(T* __restrict__ const& a) {
-    #pragma unroll
-    for (uint i = 0; i < n - 1; ++i) {
-        auto jM = i;
-        #pragma unroll
-        for (uint j = i + 1; j < n; j++) {
-            if (a[j] < a[jM]) {
-                jM = j;
-            }
-        }
-        cuda::std::swap(a[jM], a[i]);
-    }
-}
-
-__global__ void theatre(const bool skip = true) {
-    constexpr auto k = 4U;
-    cuda::std::array<HT, k> heap{};
-    __shared__ HT sHeap[k];
-    #pragma unroll
-    for (uint i = 0; i < k; ++i) {
-        sHeap[i] = HT{k, i};
-        heap[i] = HT{k, i};
-    }
-    uint64_t start = 0, end = 0;
-    float sC = 0.0f;
-    float lC = 0.0f;
-    float qC = 0.0f;
-    // print_tensor(heapT); printf("\n");
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
-    make_heap(sHeap, sHeap + k, cuda::std::greater{});
-    pop_heap(sHeap, sHeap + k, cuda::std::greater{});
-    #pragma unroll
-    for (uint i = 0; i < 64 - k; ++i) {
-        push_heap(sHeap, sHeap + k, cuda::std::greater{});
-        pop_heap(sHeap, sHeap + k, cuda::std::greater{});
-    }
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    sC = static_cast<float>(end - start);
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
-    make_heap(heap.begin(), heap.end(), cuda::std::greater{});
-    pop_heap(heap.begin(), heap.end(), cuda::std::greater{});
-    #pragma unroll
-    for (uint i = 0; i < 64 - k; ++i) {
-        push_heap(heap.begin(), heap.end(), cuda::std::greater{});
-        pop_heap(heap.begin(), heap.end(), cuda::std::greater{});
-    }
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    lC = static_cast<float>(end - start);
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    qC = static_cast<float>(end - start);
-    if (!skip) {
-        printf("sC is %f, lC is %f, qC is %f", sC, lC, qC);
-    }
-
-}
 #define TIMING 1
+__global__ void blockReduction(const float init, float* __restrict__ p, const bool skip = true) {
+    constexpr auto bM = 128U;
+    constexpr auto bN = 64U;
+    using BlockReduce = cub::BlockReduce<float, bM>;
+    __shared__ __align__(16) cuda::std::byte workspace[bN * sizeof(BlockReduce::TempStorage)];
+    auto* wT = CAST_TO(BlockReduce::TempStorage, workspace);
+    cutlass::AlignedArray<float, bN> accumulator{};
 
-__global__ void stage(const float init, uint* __restrict__ p, const bool skip = true) {
-    constexpr auto k = 64U;
-    constexpr auto ik = 1U;
-    cutlass::AlignedArray<float, k> heap{};
-    cutlass::AlignedArray<uint8_t, k> rC{};
-    __shared__ __align__(16) uint8_t checked[k];
-    __shared__ __align__(16) uint8_t indices[ik];
     #pragma unroll
-    for (uint i = 0; i < k; ++i) {
-        heap[i] = init - static_cast<float>(i);
-        checked[i] = 0U;
+    for (uint i = 0; i < bN; ++i) {
+        accumulator[i] = static_cast<float>(threadIdx.x) + init;
     }
-    auto ii = 0U;
 #if TIMING
-    uint64_t start = 0, end = 0;
-    double iC = 0.0f;
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+    float clocked = 0.0f;
+    constexpr auto trials = 1U;
+    for (uint j = 0; j < trials; ++j) {
+        uint64_t start, end;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
 #endif
-
-    #pragma unroll
-    for (uint i = 0; i < ik; ++i) {
-        auto v = -cuda::std::numeric_limits<V>::infinity();
-        uint idx = 0U;
+        constexpr auto wS = 32U;
+        float cache[bN / wS];
+        // Reduce down the column, completes in about 9.5 𝜇s
         #pragma unroll
-        for (uint j = 0; j < k; ++j) {
-            rC[j] = checked[j];
+        for (uint i = 0; i < bN; ++i) {
+            auto interim = BlockReduce(wT[i]).Sum(accumulator[i]);
+            // thread0 has the aggregate, which it broadcasts to all threads in its warp
+            interim = __shfl_sync(0xffffffff, interim , 0);
+            // Each thread owns bN / warpSize elements in striped arrangement.
+            // We duplicate this value layout across all warps in the block, but only use the first warp's values.
+            cache[i / wS] = threadIdx.x % wS == i % wS? interim : cache[i / wS];
         }
-        #pragma unroll
-        for (uint j = 0; j < k; ++j) {
-            if (heap[j] > v && !rC[j]) {
-                idx = j;
-                v = heap[j];
+        if (threadIdx.x < wS) {
+            // Only the first warp aggregates atomically, as other warps have garbage values
+            #pragma unroll
+            for (uint i = 0; i < bN / wS; ++i) {
+                atomicAdd(p + (threadIdx.x + i * wS),  cache[i]);
             }
         }
-        checked[idx] = 1U;
-        indices[ii++] = idx;
-    }
 #if TIMING
-    asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
-    iC = static_cast<double>(end - start);
-    if (!skip) {
-        printf("iC is %f\n", iC);
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        clocked += static_cast<float>(end - start) / static_cast<float>(trials);
+    }
+    if (!threadIdx.x && !skip) {
+        printf("Block Reduction takes %.2fns and p[63] is %f\n", clocked, p[63]);
     }
 #endif
-    p[ik - 1] = indices[ik - 1];
 }
 
 __host__ __forceinline__
-void hostTheatre() {
-    for (uint i = 0; i < 128; ++i) {
-        theatre<<<1,1>>>();
-    }
-    theatre<<<1,1>>>(false);
-    CUTE_CHECK_LAST();
-}
-
-__host__ __forceinline__
-void hostStage() {
-    // use volatile to deactivate compiler optimizations
-    const volatile float k = 64.f;
-    uint* p;
-    CHECK_ERROR_EXIT(cudaMalloc(&p, 2 * k * sizeof(uint)));
+void hostBR() {
+    volatile const float init = 1.0f;
+    float* p;
+    constexpr auto bN = 64U;
+    const auto play = cudaStreamPerThread;
+    CHECK_ERROR_EXIT(cudaMallocAsync(&p, sizeof(float) * bN, play));
+    CHECK_ERROR_EXIT(cudaMemsetAsync(p, 0, sizeof(float) * bN, play));
 #if TIMING
     for (uint i = 0; i < 128; ++i) {
-        stage<<<1,1>>>(k, p);
+        blockReduction<<<1, 128, 0, play>>>(init, p);
     }
 #endif
-    stage<<<1,1>>>(k, p, false);
-    CUTE_CHECK_LAST();
+    blockReduction<<<1, 128, 0, play>>>(init, p, false);
+    CHECK_ERROR_EXIT(cudaFreeAsync(p, play));
+    CHECK_LAST();
 }
+
 int main() {
-    hostStage();
+    hostBR();
 }

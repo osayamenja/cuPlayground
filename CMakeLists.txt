@@ -99,7 +99,7 @@ CPMAddPackage(
         DOWNLOAD_ONLY
 )
 if(FMT_ADDED)
-    target_include_directories(cuPlayground SYSTEM PRIVATE "${FMT_SOURCE_DIR}/include")
+    target_link_libraries(cuPlayground PRIVATE fmt::fmt)
 endif ()
 
 set(NvidiaCutlass_ROOT "${CUTLASS_SOURCE_DIR}")

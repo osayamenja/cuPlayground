@@ -47,9 +47,7 @@ add_executable(cuPlayground main.cu
         mma.cuh
         debug.cuh
         benchmarks.cuh
-        auditorium/pipelining.cuh
         auditorium/combine.cuh
-        scaledMMA.cuh
         auditorium/scheduling.cuh
 )
 set_target_properties(cuPlayground PROPERTIES

@@ -6,6 +6,7 @@
 #define GEMM_CUH
 
 #include <cublasdx.hpp>
+#include <fmt/core.h>
 
 template<class GEMM>
 __global__ void gemm_kernel(const typename GEMM::c_value_type  alpha,

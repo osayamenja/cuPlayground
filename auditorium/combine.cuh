@@ -8,7 +8,6 @@
 #include <cooperative_groups/memcpy_async.h>
 #include <cublasdx.hpp>
 #include <cuda/std/array>
-#include <cuda/std/type_traits>
 #include <cute/tensor.hpp>
 #include <cutlass/array.h>
 #include <cuda/atomic>
@@ -23,12 +22,12 @@ struct VAA {
     template<class Registers>
     requires isRegisterV<Registers>
     __device__ __forceinline__
-    void operator()(Element* __restrict__ const& gS, Registers registers) const {
+    void operator()(Element* __restrict__ const& gS, Registers const& registers) const {
         // Float is the "safe accumulator type"
         // We acknowledge this by converting registers to float before accumulating.
         auto regLoadOp = cutlass::NumericConverter<float, typename Registers::value_type>{};
         #pragma unroll
-        for (uint i = 0; i < registers.size(); ++i) {
+        for (uint i = 0; i < Registers::kElements; ++i) {
             atomicAdd(gS + i, regLoadOp(registers(i)));
         }
     }
@@ -41,9 +40,9 @@ struct VAA<Arch, cute::half_t> {
     requires isRegisterV<Registers> &&
         cuda::std::is_same_v<typename Registers::value_type, cute::half_t>
     __device__ __forceinline__
-    void operator()(cute::half_t* __restrict__ const& gS, Registers registers) const {
-        using vType = cuda::std::conditional_t<registers.size() % 2 == 0, __half2, __half>;
-        constexpr auto len = registers.size() / (sizeof(vType) / sizeof(__half));
+    void operator()(cute::half_t* __restrict__ const& gS, Registers const& registers) const {
+        using vType = cuda::std::conditional_t<Registers::kElements % 2 == 0, __half2, __half>;
+        constexpr auto len = Registers::kElements / (sizeof(vType) / sizeof(__half));
         auto* __restrict__ gSv = CAST_TO(vType, gS);
         const auto* __restrict__ vRegs = CAST_TO(vType, registers.data());
         #pragma unroll
@@ -60,9 +59,9 @@ struct VAA<Arch, cute::bfloat16_t> {
     requires isRegisterV<Registers> &&
         cuda::std::is_same_v<typename Registers::value_type, cute::bfloat16_t>
     __device__ __forceinline__
-    void operator()(cute::bfloat16_t* __restrict__ const& gS, Registers registers) const {
-        using vType = cuda::std::conditional_t<registers.size() % 2 == 0, __nv_bfloat162, __nv_bfloat16>;
-        constexpr auto len = registers.size() / (sizeof(vType) / sizeof(__half));
+    void operator()(cute::bfloat16_t* __restrict__ const& gS, Registers const& registers) const {
+        using vType = cuda::std::conditional_t<Registers::kElements % 2 == 0, __nv_bfloat162, __nv_bfloat16>;
+        constexpr auto len = Registers::kElements / (sizeof(vType) / sizeof(__half));
         auto* __restrict__ gSv = CAST_TO(vType, gS);
         const auto* __restrict__ vRegs = CAST_TO(vType, registers.data());
         #pragma unroll
@@ -79,11 +78,11 @@ struct VAA<900, float> {
     requires isRegisterV<Registers> &&
         cuda::std::is_same_v<typename Registers::value_type, float>
     __device__ __forceinline__
-    void operator()(float* __restrict__ const& gS, Registers registers) const {
-        static_assert(registers.size() % 2 == 0, "Register tensor does not vectorize");
-        using vType = cuda::std::conditional_t<registers.size() % 4 == 0, float4,
-            cuda::std::conditional_t<registers.size() % 2 == 0, float2, float>>;
-        constexpr auto len = registers.size() / (sizeof(vType) / sizeof(float));
+    void operator()(float* __restrict__ const& gS, Registers const& registers) const {
+        static_assert(Registers::kElements % 2 == 0, "Register tensor does not vectorize");
+        using vType = cuda::std::conditional_t<Registers::kElements % 4 == 0, float4,
+            cuda::std::conditional_t<Registers::kElements % 2 == 0, float2, float>>;
+        constexpr auto len = Registers::kElements / (sizeof(vType) / sizeof(float));
         auto* __restrict__ gSv = CAST_TO(vType, gS);
         const auto* __restrict__ vRegs = CAST_TO(vType, registers.data());
         #pragma unroll
@@ -176,7 +175,7 @@ struct Combine {
             }
             else {
                 // vector copy from registers to global directly
-                constexpr auto vL = registers.size() * sizeof(Element) / sizeof(uint4);
+                constexpr auto vL = Registers::kElements * sizeof(Element) / sizeof(uint4);
                 auto* __restrict__ aP = CAST_TO(uint4, &activations(tokenIdx, 0));
                 const auto* __restrict__ rD = CAST_TO(uint4, registers.data());
                 #pragma unroll
@@ -203,10 +202,6 @@ __global__ __maxnreg__(128) void deviceCombine(cuda::std::byte* __restrict__ p) 
     cutlass::AlignedArray<Element, BLOCK_N> regs{};
     constexpr Combine<800, Element> combineOp{};
     combineOp(scratch, tokenIndices, regs, inputs, activations, M, N, blockIdx.x, M);
-    /*__syncthreads();
-    if (!threadIdx.x) {
-        cute::print_tensor(activations);
-    }*/
 }
 
 __host__ __forceinline__

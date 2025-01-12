@@ -6,13 +6,13 @@
 #define TILING_CUH
 
 #include <cublasdx.hpp>
-#include <cuda/std/type_traits>
 #include <cute/arch/copy.hpp>
 #include <cute/arch/copy_sm80.hpp>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/collective/collective_mma.hpp>
 #include <cutlass/epilogue/thread/activation.h>
 
+#include "../util.cuh"
 // GEMM configuration constants
 #define MIN_ARCH 700
 #define THREADS 128U
@@ -24,47 +24,43 @@
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
 #define PIPELINE_STAGES 2
 
+/// Fused, Add, Activate
 template <typename Element, typename ActivationFunction>
-requires(cuda::std::is_same_v<Element, cute::half_t> ||
-    cuda::std::is_same_v<Element, cute::bfloat16_t> ||
-    cuda::std::is_same_v<Element, cute::tfloat32_t> ||
-    cuda::std::is_same_v<Element, float> ||
-    cuda::std::is_same_v<Element, cute::float_e4m3_t> ||
-    cuda::std::is_same_v<Element, cute::float_e5m2_t>)
-CUTE_DEVICE
-auto fusedAddActivate(Element& accumulator, const Element& term, const ActivationFunction& op) {
-    if constexpr (sizeof(Element) >= 4) {
-        return op(fma(Element(1.0f), accumulator, term));
+requires(TensorValueType<Element> && cuda::std::is_invocable_r_v<Element, ActivationFunction, Element>)
+struct FAA {
+    // fp8
+    static_assert(sizeof(Element) == 1 || sizeof(Element) >= 4);
+    __forceinline__ __device__
+    Element operator()(const Element& accumulator, const Element& term) const {
+        constexpr ActivationFunction op{};
+        return op(accumulator + term);
     }
-    if constexpr(sizeof(Element) == 2) {
-        // Half FMA
-        if constexpr (cuda::std::is_same_v<Element, cute::half_t>) {
-            return op(cute::half_t(__hfma(__half(1.0f), accumulator.to_half(), term.to_half())));
-        }
-        // bfloat16 FMA
-        return op(cute::bfloat16_t(__hfma(__nv_bfloat16(1.0f), accumulator.to_nv_bfloat16(), term.to_nv_bfloat16())));
+};
+
+// specialization for half-precision and relu
+template<>
+struct FAA<cute::half_t, cutlass::epilogue::thread::ReLU<cute::half_t>> {
+    __forceinline__ __device__
+    cute::half_t operator()(const cute::half_t& accumulator, const cute::half_t& term) const {
+        return cute::half_t(__hfma_relu(__half(1.0f),accumulator.to_half(), term.to_half()));
     }
-    return op(accumulator + term);
-}
+};
 
-// conversion operators are reinterpret casts, so technically should be free at runtime
-// Below is 2.5X faster
+// specialization for bfloat16 and relu
 template<>
-CUTE_DEVICE
-auto fusedAddActivate(cute::half_t& accumulator, const cute::half_t& term,
-    const cutlass::epilogue::thread::ReLU<cute::half_t>& op) {
-    return cute::half_t(__hfma_relu(__half(1.0f),
-        accumulator.to_half(), term.to_half()));
-}
+struct FAA<cute::bfloat16_t, cutlass::epilogue::thread::ReLU<cute::bfloat16_t>> {
+    __forceinline__ __device__
+    cute::bfloat16_t operator()(const cute::bfloat16_t& accumulator, const cute::bfloat16_t& term) const {
+        return cute::bfloat16_t(__hfma_relu(__nv_bfloat16(1.0f),
+            accumulator.to_nv_bfloat16(), term.to_nv_bfloat16()));
+    }
+};
 
-// Below is 2.5X faster
-template<>
-CUTE_DEVICE
-auto fusedAddActivate(cute::bfloat16_t& accumulator, const cute::bfloat16_t& term,
-    const cutlass::epilogue::thread::ReLU<cute::bfloat16_t>& op) {
-    return cute::bfloat16_t(__hfma_relu(__nv_bfloat16(1.0f),
-        accumulator.to_nv_bfloat16(), term.to_nv_bfloat16()));
-}
+template<typename F>
+struct isFAA : cuda::std::false_type {};
+
+template<typename Element, typename ActivationFunction>
+struct isFAA<FAA<Element, ActivationFunction>> : cuda::std::true_type {};
 
 template<typename T>
 using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
@@ -337,40 +333,13 @@ struct CollectiveMMAConfig{
     cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>>;
 };
 
-template<typename ElementA, typename ElementB, typename ElementC, unsigned int Arch>
-struct ProcessorGEMM {
-    using BlockMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, BLOCK_K_FULL>()
-                          + cublasdx::Precision<toCDX<ElementA>, toCDX<ElementB>, toCDX<ElementC>>()
-                          + cublasdx::Type<cublasdx::type::real>()
-                          + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major>()
-                          + cublasdx::Function<cublasdx::function::MM>()
-                          + cublasdx::SM<Arch>()
-                          + cublasdx::Block()
-                          + cublasdx::BlockDim<THREADS>());
-    using blockTiler = cute::Shape<cute::Int<cublasdx::size_of<BlockMM>::m>,
-                                    cute::Int<cublasdx::size_of<BlockMM>::n>,
-                                    cute::Int<cublasdx::size_of<BlockMM>::k>>;
-    using Parameters = CollectiveMMAConfig<BlockMM, LayoutOptimization::UseSwizzle>;
-    using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        typename Parameters::dispatch,
-        blockTiler,
-        ElementA,
-        cute::Underscore,
-        ElementB,
-        cute::Underscore,
-        typename Parameters::mma_t,
-        typename Parameters::gCopyA,
-        typename Parameters::sLayA,
-        typename Parameters::sCopyA,
-        cute::identity,
-        typename Parameters::gCopyB,
-        typename Parameters::sLayB,
-        typename Parameters::sCopyB,
-        cute::identity
-    >;
-};
-
-template<typename ElementA, typename ElementB, typename ElementC, unsigned int Arch>
+template<
+    typename ElementA,
+    typename ElementB,
+    typename ElementC,
+    unsigned int Arch,
+    typename ActivationOp = cute::identity
+>
 struct BlockMM {
     static_assert(BLOCK_M == THREADS);
     static_assert(BLOCK_M == 128);
@@ -410,5 +379,6 @@ struct BlockMM {
         typename Parameters::sCopyB,
         cute::identity
     >;
+    using FusedEpilogue = FAA<ElementC, ActivationOp>;
 };
 #endif //TILING_CUH

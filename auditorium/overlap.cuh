@@ -5,12 +5,17 @@
 #ifndef OVERLAP_CUH
 #define OVERLAP_CUH
 
+#include <cooperative_groups/memcpy_async.h>
 #include <cute/tensor.hpp>
+#include <cutlass/epilogue/thread/activation.h>
 #include <cuda/std/type_traits>
 #include <cublasdx.hpp>
+#include <fmt/core.h>
 #include <nvshmemx.h>
 #include <nvshmem.h>
 #include <host/nvshmemx_api.h> // Makes CLion happy
+
+#include "../util.cuh"
 
 enum signal : unsigned short {
     NOOP,
@@ -21,7 +26,7 @@ enum signal : unsigned short {
 #define STAGES 2U
 #define CELLS 2U
 template<unsigned int stage=0, typename T>
-// Pointer arithmetic on void yields undefined behaviour
+// Pointer arithmetic on void yields undefined behavior
 requires (stage < STAGES && !cuda::std::is_same_v<T, void>)
 CUTE_DEVICE
 T* advanceHeap(T* const& __restrict__ buffer, const unsigned int& slotSize,
@@ -151,6 +156,7 @@ __global__ void overlapKernel(const typename GEMM::a_value_type* __restrict__ in
     memcpy_async(cooperative_groups::this_thread_block(), staging, BYTE_CAST(sC), sliceBytes);
 }
 
+__host__ __forceinline__
 void overlapPrototype() {
     auto playStream = cudaStreamPerThread;
     // construct GEMM description

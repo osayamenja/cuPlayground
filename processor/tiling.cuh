@@ -22,7 +22,7 @@
 #define BLOCK_K_HALF 16
 #define BLOCK_K_FULL 8
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
-#define PIPELINE_STAGES 2
+#define PIPELINE_STAGES 4
 
 /// Fused, Add, Activate
 template <typename Element, typename ActivationFunction>

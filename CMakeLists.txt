@@ -49,6 +49,7 @@ add_executable(cuPlayground main.cu
         benchmarks.cuh
         auditorium/combine.cuh
         auditorium/scheduling.cuh
+        warpScheduler.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON

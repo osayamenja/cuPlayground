@@ -191,7 +191,7 @@ void schedulerStart(const unsigned int& tQRl,
     while (scheduled < atomicLoad<cuda::thread_scope_block>(taskBound)) {
         constexpr auto rQSetSize = 16;
         // sweep all static wQHeads and schedule pending tasks
-        staticSchedule<processorCount, producerCount, wSetSize, rQSetSize>(scheduled, rtQTails,tQRl, tQTails,
+        staticSchedule<processorCount, producerCount, wSetSize, rQSetSize>(scheduled, rtQTails, tQRl, tQTails,
             tQHeads, rQHead, rQTail, rQ, pDB);
         // Now do dynamic scheduling
         dynamicSchedule<processorCount, wSetSize, rQSetSize>(scheduled, rtQTails, gtQRl, gtQTails,

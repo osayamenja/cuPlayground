@@ -1,6 +1,4 @@
-#include <cooperative_groups.h>
-__global__ void tCG() {
-
-}
+#include "warpScheduler.cuh"
 int main() {
+    hostSchedule();
 }

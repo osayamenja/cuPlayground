@@ -10,6 +10,7 @@
 #include <cutlass/array.h>
 #include "util.cuh"
 
+#define MEASURE 0
 __device__
 struct __align__(4) TQState {
     uint16_t tQTail;
@@ -244,12 +245,11 @@ __global__ __maxnreg__(128) void wScheduler(unsigned int* __restrict__ p, const 
     constexpr auto tilesN = N / bN;
     constexpr auto tilesNx = Nx / bN;
     constexpr auto gtQCL = tilesM;
-    constexpr auto nTQH = subscribers + gtQCL;
     constexpr auto fTB = tilesM * tilesNx;
     constexpr auto tQRl = cute::ceil_div(fTB, subscribers);
     auto* __restrict__ interrupt = p;
     if (blockIdx.x + 1 == processorCount) {
-        constexpr auto scratchSize = (nTQH + 1 + processorCount) * sizeof(uint) +
+        constexpr auto scratchSize = (subscribers + 1 + processorCount) * sizeof(uint) +
             2 * sizeof(cub::WarpScan<uint>::TempStorage);
         __shared__ __align__(16) cuda::std::byte workspace[scratchSize];
         auto* __restrict__ gtQHeads = interrupt + processorCount;
@@ -261,10 +261,10 @@ __global__ __maxnreg__(128) void wScheduler(unsigned int* __restrict__ p, const 
         auto* __restrict__ tQHeads = CAST_TO(uint, workspace);
         constexpr auto residue = fTB - fTB / subscribers * subscribers;
         #pragma unroll
-        for (uint i = threadIdx.x; i < nTQH; i+= threads) {
+        for (uint i = threadIdx.x; i < subscribers; i+= threads) {
             tQHeads[i] = fTB / subscribers + (i < residue);
         }
-        auto* __restrict__ rQ = tQHeads + nTQH;
+        auto* __restrict__ rQ = tQHeads + subscribers;
         #pragma unroll
         for (uint i = threadIdx.x; i < processorCount; i+= threads) {
             rQ[i] = i;
@@ -274,16 +274,22 @@ __global__ __maxnreg__(128) void wScheduler(unsigned int* __restrict__ p, const 
             *taskBound = tilesM * tilesN + tilesM * tilesNx;
         }
         __syncthreads();
-        if (threadIdx.x % wS == 0) {
+        if (threadIdx.x / wS == 0) {
+#if MEASURE
             uint64_t begin, end;
             asm volatile("mov.u64 %0, %%globaltimer;": "=l"(begin)::);
-            start<processorCount>(workspace + (nTQH + 1 + processorCount) * sizeof(uint), tQRl, gtQCL, tQHeads,
+#endif
+
+            start<processorCount>(workspace + (subscribers + 1 + processorCount) * sizeof(uint),
+                tQRl, gtQCL, tQHeads,
                 gtQHeads, taskBound, rQ, sQ, sQ + processorCount);
+#if MEASURE
             asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
             __syncwarp();
             if(!skip && !threadIdx.x) {
                 printf("Time taken is %fus\n", static_cast<float>(end - begin) / 1000.0f);
             }
+#endif
         }
         __syncthreads();
         #pragma unroll
@@ -318,10 +324,12 @@ void hostSchedule() {
     CHECK_ERROR_EXIT(cudaMallocAsync(&p, len, cudaStreamPerThread));
     CHECK_ERROR_EXIT(cudaMemsetAsync(p, 0U, processorCount * sizeof(uint), cudaStreamPerThread));
 
+#if MEASURE
     for (uint i = 0; i < 256; ++i) {
         wScheduler<processorCount, M, N, Nx, bM, bN, threads><<<processorCount, threads, 0, cudaStreamPerThread>>>(p);
         CHECK_ERROR_EXIT(cudaMemsetAsync(p, 0U, processorCount * sizeof(uint), cudaStreamPerThread));
     }
+#endif
     wScheduler<processorCount, M, N, Nx, bM, bN, threads><<<processorCount, threads, 0, cudaStreamPerThread>>>(p, false);
     CHECK_ERROR_EXIT(cudaFreeAsync(p, cudaStreamPerThread));
     CHECK_LAST();

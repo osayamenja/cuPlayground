@@ -23,6 +23,40 @@ enum ReadySignal : unsigned int {
     ready
 };
 
+template<unsigned int processors, typename WSet>
+requires(processors > 0 && isRegisterV<WSet>)
+__device__ __forceinline__
+void schedule(WSet& wSet, const uint& cSetB,
+    const uint& canSchedule, const uint& taskIdx, uint& lRQIdx,
+    const uint& gRQIdx, uint* __restrict__ const& rQ,
+    unsigned int* __restrict__ const& pDB) {
+    for (uint k = 0; k < cSetB; ++k) {
+        #pragma unroll
+        for (uint l = 0; l < WSet::kElements; ++l) {
+            wSet[l] = rQ[(gRQIdx + lRQIdx++) % processors];
+        }
+        #pragma unroll
+        for (uint l = 0; l < WSet::kElements; ++l) {
+            // signal processor
+            atomicExch(pDB + wSet[l], taskIdx + (k * WSet::kElements + l));
+        }
+    }
+    // Residual scheduling
+    const auto residue = canSchedule - cSetB * WSet::kElements;
+    #pragma unroll
+    for (uint l = 0; l < WSet::kElements; ++l) {
+        if (l < residue) {
+            wSet[l] = rQ[(gRQIdx + lRQIdx++) % processors];
+        }
+    }
+    #pragma unroll
+    for (uint l = 0; l < WSet::kElements; ++l) {
+        if (l < residue) {
+            atomicExch(pDB + wSet[l], taskIdx + (cSetB * WSet::kElements + l));
+        }
+    }
+}
+
 template<
     unsigned int processors,
     typename WarpScan = cub::WarpScan<uint>,
@@ -30,13 +64,15 @@ template<
     unsigned int subscribers = 128 - wS,
     unsigned int sL = subscribers / wS,
     typename SQState,
-    typename TQState
+    typename TQState,
+    typename WSet
 >
 requires (processors > 0 && wS == 32 &&
     cuda::std::is_same_v<WarpScan, cub::WarpScan<uint>> &&
-    isRegisterV<SQState> && isRegisterV<TQState> && subscribers % wS == 0)
+    isRegisterV<SQState> && isRegisterV<TQState> && isRegisterV<WSet>
+    && subscribers % wS == 0)
 __device__ __forceinline__
-void schedulerLoop(SQState& sQState, TQState& tqState,
+void schedulerLoop(SQState& sQState, TQState& tqState, WSet& wSet,
     const unsigned int& tQRl,
     uint& lTt, uint& taskTally, uint& processorTally,
     uint& gRQIdx, bool& pTEpilog, uint& scheduled,
@@ -109,10 +145,8 @@ void schedulerLoop(SQState& sQState, TQState& tqState,
                         tasksToSchedule -= canSchedule;
                         tqState[j].tasks -= canSchedule;
                         const auto taskIdx = j * wS + threadIdx.x + tqState[j].tQTail;
-                        for (uint k = 0; k < canSchedule; ++k) {
-                            // signal processor
-                            atomicExch(pDB + rQ[gRQIdx + lRQIdx++ % processors], taskIdx + k);
-                        }
+                        const auto cSetB = canSchedule / WSet::kElements;
+                        schedule<processors>(wSet, cSetB, canSchedule, taskIdx, lRQIdx, gRQIdx, rQ, pDB);
                     }
                 }
             }
@@ -124,10 +158,8 @@ void schedulerLoop(SQState& sQState, TQState& tqState,
                     tasksToSchedule -= canSchedule;
                     tqState[j].tasks -= canSchedule;
                     const auto taskIdx = tQRl * subscribers + (j - sL) * wS + threadIdx.x + tqState[j].tQTail;
-                    for (uint k = 0; k < canSchedule; ++k) {
-                        // signal processor
-                        atomicExch(pDB + rQ[gRQIdx + lRQIdx++ % processors], taskIdx + k);
-                    }
+                    const auto cSetB = canSchedule / WSet::kElements;
+                    schedule<processors>(wSet, cSetB, canSchedule, taskIdx, lRQIdx, gRQIdx, rQ, pDB);
                 }
             }
         }
@@ -157,6 +189,7 @@ void start(cuda::std::byte* __restrict__ workspace,
     // initialize register buffers
     cutlass::Array<TQState, 16 + sL> tqState{};
     cutlass::Array<uint8_t, sQsL> sQState{};
+    cutlass::AlignedArray<uint, 16> wSet{};
     tqState.fill({0U,0U});
     sQState.fill(0U);
 
@@ -195,7 +228,7 @@ void start(cuda::std::byte* __restrict__ workspace,
                 lTt += tasks;
             }
             // schedule observed tasks
-            schedulerLoop<processors>(sQState, tqState, tQRl, lTt, taskTally,
+            schedulerLoop<processors>(sQState, tqState, wSet, tQRl, lTt, taskTally,
                 processorTally, gRQIdx, pTEpilog, scheduled, wSt, sQ, rQ, pDB, true);
 
             for (uint i = 1; i < dT; ++i) {
@@ -208,7 +241,7 @@ void start(cuda::std::byte* __restrict__ workspace,
                     lTt += tasks;
                 }
                 // schedule observed tasks
-                schedulerLoop<processors>(sQState, tqState, tQRl, lTt, taskTally,
+                schedulerLoop<processors>(sQState, tqState, wSet, tQRl, lTt, taskTally,
                     processorTally, gRQIdx, pTEpilog, scheduled, wSt, sQ, rQ, pDB);
             }
         }
@@ -223,7 +256,7 @@ void start(cuda::std::byte* __restrict__ workspace,
             }
         }
         // schedule observed tasks
-        schedulerLoop<processors>(sQState, tqState, tQRl, lTt, taskTally,
+        schedulerLoop<processors>(sQState, tqState, wSet, tQRl, lTt, taskTally,
             processorTally, gRQIdx, pTEpilog, scheduled, wSt, sQ, rQ, pDB, dT == 0);
     }
 }

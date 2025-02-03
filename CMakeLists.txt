@@ -128,6 +128,9 @@ CPMFindPackage(
 set(USE_SYSTEM_NVTX ON)
 set(CAFFE2_USE_CUDNN ON)
 find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
+if(NOT Torch_FOUND)
+    message(FATAL_ERROR "LibTorch not found!")
+endif ()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
 

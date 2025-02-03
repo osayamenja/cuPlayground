@@ -35,10 +35,6 @@ check_compiler_flag(CUDA -t4 NVCC_THREADS)
 
 find_package(CUDAToolkit REQUIRED)
 
-set(CAFFE2_USE_CUDNN ON)
-#find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
-
 add_executable(cuPlayground main.cu
         processor/gemm.cuh
         processor/tiling.cuh
@@ -89,6 +85,8 @@ CPMAddPackage(
 if(CUTLASS_ADDED)
     # header-only
     target_include_directories(cuPlayground SYSTEM PRIVATE "${CUTLASS_SOURCE_DIR}/include")
+    set(NvidiaCutlass_ROOT "${CUTLASS_SOURCE_DIR}")
+    set(mathdx_CUTLASS_ROOT "${CUTLASS_SOURCE_DIR}")
 endif ()
 
 CPMAddPackage(
@@ -101,8 +99,21 @@ if(FMT_ADDED)
     target_link_libraries(cuPlayground PRIVATE fmt::fmt)
 endif ()
 
-set(NvidiaCutlass_ROOT "${CUTLASS_SOURCE_DIR}")
-set(mathdx_CUTLASS_ROOT "${CUTLASS_SOURCE_DIR}")
+CPMAddPackage(
+        NAME NVTX3
+        GITHUB_REPOSITORY NVIDIA/NVTX
+        GIT_TAG v3.1.0-c-cpp
+        GIT_SHALLOW TRUE
+)
+
+if(NVTX3_ADDED)
+    target_link_libraries(cuPlayground PRIVATE nvtx3-cpp)
+    string(FIND "$ENV{CMAKE_PREFIX_PATH}" "nvtx3" INDEX)
+    if(INDEX EQUAL -1)
+        # append nvtx3 to prefix path to remove libtorch error
+        set(ENV{CMAKE_PREFIX_PATH} "$ENV{CMAKE_PREFIX_PATH}:${NVTX3_SOURCE_DIR}")
+    endif()
+endif ()
 
 set(MATHDX_VER 24.08)
 set(MATHDX_URL_PREFIX "https://developer.download.nvidia.com/compute/cublasdx/redist/cublasdx")
@@ -113,6 +124,12 @@ CPMFindPackage(
         URL "${MATHDX_URL}"
         FIND_PACKAGE_ARGUMENTS "REQUIRED COMPONENTS cublasdx CONFIG"
 )
+
+set(USE_SYSTEM_NVTX ON)
+set(CAFFE2_USE_CUDNN ON)
+find_package(Torch REQUIRED HINTS "$ENV{TORCH_ROOT}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
+target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
 
 target_link_libraries(cuPlayground PRIVATE mathdx::cublasdx)
 target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::nvml CUDA::nvtx3)

@@ -140,7 +140,6 @@ void schedulerLoop(SQState& sQState, TQState& tqState, WSet& wSet,
                 #pragma unroll
                 for (uint j = 0; j < sL; ++j) {
                     if (tqState[j].tasks && tasksToSchedule) {
-                        tqState[j].tasks = 0U;
                         const auto canSchedule = cute::min(tasksToSchedule, tqState[j].tasks);
                         tasksToSchedule -= canSchedule;
                         tqState[j].tasks -= canSchedule;
@@ -153,7 +152,6 @@ void schedulerLoop(SQState& sQState, TQState& tqState, WSet& wSet,
             #pragma unroll
             for (uint j = sL; j < TQState::kElements; ++j) {
                 if (tqState[j].tasks && tasksToSchedule) {
-                    tqState[j].tasks = 0U;
                     const auto canSchedule = cute::min(tasksToSchedule, tqState[j].tasks);
                     tasksToSchedule -= canSchedule;
                     tqState[j].tasks -= canSchedule;
@@ -203,7 +201,8 @@ void start(cuda::std::byte* __restrict__ workspace,
     uint taskTally = 0U;
     uint processorTally = processors; // initially, all processors are available, ensure that rQ has all pids
     bool pTEpilog = false;
-    while (scheduled < atomicLoad<cuda::thread_scope_block>(taskBound)) {
+    auto tTB = atomicLoad<cuda::thread_scope_block>(taskBound);
+    while (scheduled < tTB) {
         // statically sweep tQ for tasks
         uint lTt = 0U; // local task tally
         #pragma unroll
@@ -258,6 +257,10 @@ void start(cuda::std::byte* __restrict__ workspace,
         // schedule observed tasks
         schedulerLoop<processors>(sQState, tqState, wSet, tQRl, lTt, taskTally,
             processorTally, gRQIdx, pTEpilog, scheduled, wSt, sQ, rQ, pDB, dT == 0);
+        if (!threadIdx.x) {
+            tTB = atomicLoad<cuda::thread_scope_block>(taskBound);
+        }
+        tTB = __shfl_sync(0xffffffff, tTB, 0);
     }
 }
 

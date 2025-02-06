@@ -85,8 +85,7 @@ CPMAddPackage(
 if(CUTLASS_ADDED)
     # header-only
     target_include_directories(cuPlayground SYSTEM PRIVATE "${CUTLASS_SOURCE_DIR}/include")
-    set(NvidiaCutlass_ROOT "${CUTLASS_SOURCE_DIR}")
-    set(mathdx_CUTLASS_ROOT "${CUTLASS_SOURCE_DIR}")
+    set(cublasdx_CUTLASS_ROOT "${CUTLASS_SOURCE_DIR}")
 endif ()
 
 CPMAddPackage(
@@ -114,15 +113,17 @@ if(NVTX3_ADDED)
         set(ENV{CMAKE_PREFIX_PATH} "$ENV{CMAKE_PREFIX_PATH}:${NVTX3_SOURCE_DIR}")
     endif()
 endif ()
-
-set(MATHDX_VER 24.08)
-set(MATHDX_URL_PREFIX "https://developer.download.nvidia.com/compute/cublasdx/redist/cublasdx")
-set(MATHDX_URL "${MATHDX_URL_PREFIX}/nvidia-mathdx-${MATHDX_VER}.0.tar.gz")
+set(MATHDX_VER 25.01)
 CPMFindPackage(
         NAME mathdx
         VERSION "${MATHDX_VER}"
-        URL "${MATHDX_URL}"
         FIND_PACKAGE_ARGUMENTS "REQUIRED COMPONENTS cublasdx CONFIG"
+)
+
+CPMFindPackage(
+        NAME mathdx
+        VERSION "${MATHDX_VER}"
+        FIND_PACKAGE_ARGUMENTS "REQUIRED COMPONENTS cufftdx CONFIG"
 )
 
 set(USE_SYSTEM_NVTX ON)

@@ -1,8 +1,8 @@
 #include <array>
 #include <iostream>
 
+#include <cuda/barrier>
 #include <cublasdx.hpp>
-#include <cutlass/numeric_conversion.h>
 #include <torch/torch.h>
 
 #include "util.cuh"
@@ -12,8 +12,8 @@ struct Expert final : torch::nn::Module {
     torch::nn::Linear g2;
 
     Expert():
-          g1(2, 4),
-          g2(4, 2) {
+          g1(torch::nn::LinearOptions(2, 4)),
+          g2(torch::nn::LinearOptions(4, 2)) {
         register_module("g1", g1);
         register_module("g2", g2);
     }
@@ -24,49 +24,33 @@ struct Expert final : torch::nn::Module {
     }
 };
 
-__global__ void theatre() {
-    const auto x = 0.5_tf32;
-    const auto y = 0.25_tf32;
-    printf("Result is %f", __fdividef(x, y));
+struct __align__(8) Foo {
+    uint x;
+    uint y;
+};
+
+__global__ void theatre(cuda::std::byte* __restrict__ p, const uint x, const uint y) {
+    using t = cuda::std::tuple<uint, uint, uint>;
+    auto* __restrict__ uP = CAST_TO(Foo, p);
+    auto* __restrict__ uPx = CAST_TO(t, p + sizeof(Foo));
+    *uPx = t{x*x, y*x, y*y};
+    *uP = Foo{y, x};
+    __syncthreads();
+    printf("Test: %u", uP->x);
 }
 
 __host__ __forceinline__
 void tensorWork() {
+    const torch::nn::Sequential expert(
+        torch::nn::Linear(2,4),
+        torch::nn::ReLU(),
+        torch::nn::Linear(4, 2)
+        );
+    std::cout << expert << std::endl;
+
     std::array<float, 4> a{0, 1, 2, 3};
     torch::Device device(torch::kCUDA);
     const torch::Tensor tensor = torch::from_blob(a.data(), {2,2}).to(device).to(torch::kFloat8_e4m3fn);
-    switch (tensor.scalar_type()) {
-        case torch::kFloat: {
-            // tf32 is automatic
-            if (at::globalContext().allowTF32CuBLAS() || at::globalContext().allowTF32CuDNN()) {
-                std::cout << "This is tf32!" << std::endl;
-            }
-            else {
-                std::cout << "This is float!" << std::endl;
-            }
-        }
-        break;
-        case torch::kBFloat16:
-            std::cout << "This is bf16!" << std::endl;
-        break;
-        case torch::kFloat16:
-            std::cout << "This is fp16!" << std::endl;
-        break;
-        case torch::kFloat8_e4m3fn:
-            std::cout << "This is fp8e4!" << std::endl;
-        break;
-        case torch::kFloat8_e5m2:
-            std::cout << "This is fp8e5!" << std::endl;
-        break;
-        default:
-            std::cout << "This is weird!" << std::endl;
-    }
-    if (tensor.dtype() == torch::kFloat) {
-        std::cout << "This is float!" << std::endl;
-    }
-    else {
-        std::cout << "This is not float!" << std::endl;
-    }
     const Expert model;
     const Expert model2;
     std::cout << model << std::endl;
@@ -79,13 +63,37 @@ void tensorWork() {
     constexpr auto GEMMs = 2U;
     constexpr auto h = 2U;
     constexpr auto upH = 4U;
-    const torch::Tensor pT = torch::zeros({nX, GEMMs, h, upH});
+    const torch::Tensor pT = torch::zeros({nX, GEMMs, h, upH}).contiguous();
     pT[0][0] = model.named_parameters()[2].value();
+    pT[0][1] = model.named_parameters()[2].value();
     const auto expert1 = pT[0][0];
-    std::cout << expert1 << std::endl;
-    std::cout << pT.is_contiguous() << std::endl;
+
+    // flatten [s, b, h] -> [sb, h]
+    constexpr auto s = 2U;
+    constexpr auto b = 4U;
+    const torch::Tensor act = torch::ones({s, b, h}).contiguous();
+    const auto sz = act.sizes();
+    /*std::cout << sz.size() << std::endl;
+    std::cout << act << std::endl;
+    std::cout << act.view({sz[0]*sz[1], h}) << std::endl;*/
+
+    /*auto* __restrict__ p = pT.const_data_ptr<float>();
+    std::cout << p[15] << std::endl;*/
+
 }
 
 int main() {
-    tensorWork();
+    constexpr std::array<uint, 4> a{0, 1, 2, 3};
+    constexpr uint16_t tx = 2U;
+    constexpr uint16_t ty = 2U;
+    const auto t =  make_tensor(a.data(), make_layout(cute::make_shape(tx, ty), cute::LayoutRight{}));
+    print_tensor(t);
+    static_assert(alignof(cuda::barrier<cuda::thread_scope_device>) == 8);
+    cuda::std::byte* p;
+    CHECK_ERROR_EXIT(cudaMalloc(&p, sizeof(Foo) + sizeof(cuda::std::tuple<uint, uint, uint>)));
+    volatile unsigned long long int x = 30;
+    volatile uint y = 34;
+    theatre<<<1,1>>>(p, x, y);
+    CHECK_LAST();
+    CHECK_ERROR_EXIT(cudaFree(p));
 }

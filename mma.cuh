@@ -146,7 +146,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     }
 #endif
 
-#if 0
+#if 1
     if (!threadIdx.x && !skip) {
         cute::print_tensor(mD);
         cute::print_tensor(mA);
@@ -163,9 +163,9 @@ void testCollective() {
     constexpr auto N = 64;
     constexpr auto K = 64;
 
-    using inputValueType = cute::half_t;
+    using inputValueType = cute::tfloat32_t;
     using outValueType = inputValueType;
-    using weightValueType = cute::half_t;
+    using weightValueType = inputValueType;
     using accumulateType = float;
 
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
@@ -214,7 +214,7 @@ void testCollective() {
     constexpr auto gemmSharedSize = (sizeof(inputValueType) * Operation::GEMM::a_size)
         + (sizeof(weightValueType) + Operation::GEMM::b_size);
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 32 * 4);
-    deviceCollectiveMMA<Operation, sharedSize><<<1, 128, 0, playStream>>>(mA, mB, mC, mD);
+    deviceCollectiveMMA<Operation, sharedSize><<<1, 128, 0, playStream>>>(mA, mB, mC, mD, false);
     CHECK_LAST();
     CHECK_ERROR_EXIT(cudaFree(abc));
     free(data);

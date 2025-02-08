@@ -1,12 +1,14 @@
 #include <array>
 #include <iostream>
 
+#include <cuda/std/array>
+#include <cuda/std/tuple>
 #include <cuda/barrier>
 #include <cublasdx.hpp>
 #include <torch/torch.h>
 
 #include "util.cuh"
-
+#include "mma.cuh"
 struct Expert final : torch::nn::Module {
     torch::nn::Linear g1;
     torch::nn::Linear g2;
@@ -28,16 +30,6 @@ struct __align__(8) Foo {
     uint x;
     uint y;
 };
-
-__global__ void theatre(cuda::std::byte* __restrict__ p, const uint x, const uint y) {
-    using t = cuda::std::tuple<uint, uint, uint>;
-    auto* __restrict__ uP = CAST_TO(Foo, p);
-    auto* __restrict__ uPx = CAST_TO(t, p + sizeof(Foo));
-    *uPx = t{x*x, y*x, y*y};
-    *uP = Foo{y, x};
-    __syncthreads();
-    printf("Test: %u", uP->x);
-}
 
 __host__ __forceinline__
 void tensorWork() {
@@ -83,17 +75,5 @@ void tensorWork() {
 }
 
 int main() {
-    constexpr std::array<uint, 4> a{0, 1, 2, 3};
-    constexpr uint16_t tx = 2U;
-    constexpr uint16_t ty = 2U;
-    const auto t =  make_tensor(a.data(), make_layout(cute::make_shape(tx, ty), cute::LayoutRight{}));
-    print_tensor(t);
-    static_assert(alignof(cuda::barrier<cuda::thread_scope_device>) == 8);
-    cuda::std::byte* p;
-    CHECK_ERROR_EXIT(cudaMalloc(&p, sizeof(Foo) + sizeof(cuda::std::tuple<uint, uint, uint>)));
-    volatile unsigned long long int x = 30;
-    volatile uint y = 34;
-    theatre<<<1,1>>>(p, x, y);
-    CHECK_LAST();
-    CHECK_ERROR_EXIT(cudaFree(p));
+    testCollective();
 }

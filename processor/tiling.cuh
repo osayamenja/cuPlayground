@@ -22,14 +22,13 @@
 #define BLOCK_K_HALF 16
 #define BLOCK_K_FULL 8
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
-#define PIPELINE_STAGES 4
+#define PIPELINE_STAGES 2
 
 /// Fused, Add, Activate
 template <typename Element, typename ActivationFunction>
 requires(TensorValueType<Element> && cuda::std::is_invocable_r_v<Element, ActivationFunction, Element>)
 struct FAA {
     // fp8
-    static_assert(sizeof(Element) == 1 || sizeof(Element) >= 4);
     __forceinline__ __device__
     Element operator()(const Element& accumulator, const Element& term) const {
         constexpr ActivationFunction op{};
@@ -220,7 +219,7 @@ using copyArch = cuda::std::conditional_t<sizeof(Element) >= 4 && Arch >= 800,
 
 template<typename Element>
 using sCopyLay = cuda::std::conditional_t<sizeof(Element) >= 4,
-cute::SM75_U32x4_LDSM_N, cute::SM75_U32x2_LDSM_N>;
+cute::AutoVectorizingCopyWithAssumedAlignment<8 * alignof(Element)>, cute::SM75_U32x2_LDSM_N>;
 
 template<
     typename ElementA,
@@ -278,7 +277,6 @@ typename ElementA = toCT<typename GEMM::a_value_type>,
 typename ElementB = toCT<typename GEMM::b_value_type>,
 typename ElementC = toCT<typename GEMM::c_value_type>>
 requires (cublasdx::is_complete_blas<GEMM>::value
-&& cublasdx::is_supported<GEMM, cublasdx::sm_of<GEMM>::value>::value
 && cublasdx::sm_of<GEMM>::value >= MIN_ARCH
 && cublasdx::sm_of<GEMM>::value < 900)
 struct CollectiveMMAConfig{

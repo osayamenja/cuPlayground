@@ -169,7 +169,7 @@ void testCollective() {
     using accumulateType = float;
 
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
-    using Operation = BlockMM<inputValueType, weightValueType, accumulateType, 800, activation>;
+    using Operation = BlockMM<800, inputValueType, weightValueType, accumulateType, activation>;
     constexpr auto aSize = (sizeof(inputValueType) * M * K);
     constexpr auto abSize = aSize + (sizeof(weightValueType) * N * K);
     constexpr auto abcSize = abSize + (sizeof(outValueType) * M * N);
@@ -236,7 +236,7 @@ void testP2PCollective() {
     using accumulateType = float;
 
     using activation = cutlass::epilogue::thread::ReLU<accumulateType>;
-    using Operation = BlockMM<inputValueType, weightValueType, accumulateType, 800, activation>;
+    using Operation = BlockMM<800, inputValueType, weightValueType, accumulateType, activation>;
     constexpr auto aSize = sizeof(inputValueType) * M * K;
     constexpr auto abSize = aSize + sizeof(weightValueType) * N * K;
     constexpr auto cSize = sizeof(outValueType) * M * N;

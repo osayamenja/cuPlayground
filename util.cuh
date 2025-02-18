@@ -13,7 +13,9 @@
 #include <cuda/atomic>
 #include <cute/tensor.hpp>
 
+#define BLOCK_SIZE 128
 #define SHARED_SIZE 16 * 1024U
+#define CONST_CAST_TO(T, p) static_cast<const T*>(static_cast<const void*>(p))
 #define CAST_TO(T, p) static_cast<T*>(static_cast<void*>(p))
 #define BYTE_CAST(p) static_cast<cuda::std::byte*>(static_cast<void*>(p))
 #define NANO_TO_MICRO (cuda::std::nano::den / cuda::std::micro::den)

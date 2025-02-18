@@ -36,7 +36,6 @@ check_compiler_flag(CUDA -t4 NVCC_THREADS)
 find_package(CUDAToolkit REQUIRED)
 
 add_executable(cuPlayground main.cu
-        processor/gemm.cuh
         processor/tiling.cuh
         auditorium/overlap.cuh
         util.cuh
@@ -46,6 +45,7 @@ add_executable(cuPlayground main.cu
         auditorium/combine.cuh
         auditorium/scheduling.cuh
         warpScheduler.cuh
+        arch.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
@@ -156,20 +156,20 @@ endif ()
 
 target_compile_options(cuPlayground PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-Xfatbin -compress-all>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -v;--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-t0; --generate-line-info>
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=sm_${COMPUTE_CAPABILITY}>
-        # Required to support std::tuple in device code
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(cuPlayground PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-Og;-g;>
-            $<$<COMPILE_LANGUAGE:CUDA>:-O0; -g; -G>
+            $<$<COMPILE_LANGUAGE:CUDA>:-O1; -g; -G>
     )
 elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
     target_compile_options(cuPlayground PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-O3>
             $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=lto_${COMPUTE_CAPABILITY}>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -v;--expt-relaxed-constexpr>
     )
 endif ()

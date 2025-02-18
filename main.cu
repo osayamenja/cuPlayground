@@ -8,7 +8,7 @@
 #include <torch/torch.h>
 
 #include "util.cuh"
-#include "mma.cuh"
+//#include "mma.cuh"
 struct Expert final : torch::nn::Module {
     torch::nn::Linear g1;
     torch::nn::Linear g2;
@@ -47,6 +47,7 @@ void tensorWork() {
     const Expert model2;
     std::cout << model << std::endl;
     for (const auto& p : model.named_parameters()) {
+        // [0.weight, 0.bias, ...]
         std::cout << p.key() << std::endl;
         std::cout << p.value() << std::endl;
     }
@@ -73,7 +74,11 @@ void tensorWork() {
     std::cout << p[15] << std::endl;*/
 
 }
-
 int main() {
-    testCollective();
+    using mma = cute::TiledMMA<
+          cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>,
+          cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>
+    >;
+    print_latex(mma{});
+
 }

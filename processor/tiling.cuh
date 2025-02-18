@@ -9,20 +9,21 @@
 #include <cute/arch/copy.hpp>
 #include <cute/arch/copy_sm80.hpp>
 #include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/collective/builders/sm90_common.inl>
+#include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_mma.hpp>
 #include <cutlass/epilogue/thread/activation.h>
 
 #include "../util.cuh"
 // GEMM configuration constants
-#define MIN_ARCH 700
+#define MIN_ARCH 700U
 #define THREADS 128U
-#define BLOCK_M 128
-#define BLOCK_M_EXP 64
-#define BLOCK_N 64
-#define BLOCK_K_HALF 16
-#define BLOCK_K_FULL 8
+#define BLOCK_M 128U
+#define BLOCK_N 64U
+#define BLOCK_K_HALF 16U
+#define BLOCK_K_FULL 8U
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
-#define PIPELINE_STAGES 2
+#define PIPELINE_STAGES 2U
 
 /// Fused, Add, Activate
 template <typename Element, typename ActivationFunction>
@@ -85,8 +86,7 @@ template<unsigned int Arch, typename TC, typename TA=TC, typename TB=TA>
 struct MMAConfig {
     using mma = cute::TiledMMA<
                 cute::MMA_Atom<cute::UniversalFMA<TC, TA, TB>>,
-                cute::Layout<cute::Shape<cute::_16, cute::_8, cute::_1>>,
-                cute::Tile<cute::_32, cute::_32, cute::_8>
+                cute::Layout<cute::Shape<cute::_16, cute::_8, cute::_1>>
     >;
 };
 
@@ -139,7 +139,8 @@ template<>
 struct MMAConfig<800, float, cute::tfloat32_t> {
     using mma = cute::TiledMMA<
       cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>,
-      cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>>,
+      cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_1>,
+                    cute::Stride<cute::_2, cute::_1, cute::_1>>,
     cute::Tile<cute::_32, cute::_32, cute::_8>
     >;
 };
@@ -219,7 +220,7 @@ using copyArch = cuda::std::conditional_t<sizeof(Element) >= 4 && Arch >= 800,
 
 template<typename Element>
 using sCopyLay = cuda::std::conditional_t<sizeof(Element) >= 4,
-cute::AutoVectorizingCopyWithAssumedAlignment<8 * alignof(Element)>, cute::SM75_U32x2_LDSM_N>;
+cute::AutoVectorizingCopyWithAssumedAlignment<8 * 16 / sizeof(Element)>, cute::SM75_U32x2_LDSM_N>;
 
 template<
     typename ElementA,
@@ -332,17 +333,18 @@ struct CollectiveMMAConfig{
 };
 
 template<
+    unsigned int Arch,
     typename ElementA,
     typename ElementB,
     typename ElementC,
-    unsigned int Arch,
     typename ActivationOp = cute::identity
 >
+requires(cuda::std::is_same_v<ElementA, ElementB>)
 struct BlockMM {
     static_assert(BLOCK_M == THREADS);
     static_assert(BLOCK_M == 128);
     static_assert(BLOCK_N == 64, "64 is a very good value for N, change it back!");
-    using GEMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, BLOCK_K_FULL>()
+    using GEMM = decltype(cublasdx::Size<BLOCK_M, BLOCK_N, sizeof(ElementA) == 4 ? BLOCK_K_FULL : BLOCK_K_HALF>()
                           + cublasdx::Precision<toCDX<ElementA>, toCDX<ElementB>, toCDX<ElementC>>()
                           + cublasdx::Type<cublasdx::type::real>()
                           + cublasdx::Arrangement<cublasdx::row_major, cublasdx::row_major, cublasdx::row_major>()

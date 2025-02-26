@@ -46,6 +46,7 @@ add_executable(cuPlayground main.cu
         auditorium/scheduling.cuh
         warpScheduler.cuh
         arch.cuh
+        torching.cuh
 )
 set_target_properties(cuPlayground PROPERTIES
 	POSITION_INDEPENDENT_CODE ON
@@ -53,6 +54,8 @@ set_target_properties(cuPlayground PROPERTIES
 )
 
 string(SUBSTRING "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" 0 2 COMPUTE_CAPABILITY) # xx-real -> xx
+math(EXPR GPU_ARCH "${COMPUTE_CAPABILITY} * 10U" OUTPUT_FORMAT DECIMAL)
+message(STATUS "GPU 0 Compute Capability: ${COMPUTE_CAPABILITY}")
 #Link torch
 #target_precompile_headers(cuPlayground PRIVATE torchInclude.h)
 #target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
@@ -159,6 +162,57 @@ target_compile_options(cuPlayground PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:-t0; --generate-line-info>
         $<$<COMPILE_LANGUAGE:CUDA>:SHELL:-gencode=arch=compute_${COMPUTE_CAPABILITY},code=sm_${COMPUTE_CAPABILITY}>
+)
+
+# Pre-compile constants
+# Read JSON file content
+file(READ "aristos_config.json" ARISTOS_CONFIG)
+
+string(JSON CAP_FACTOR_V GET ${ARISTOS_CONFIG} "capacity_factor")
+message(STATUS "capacity_factor: ${CAP_FACTOR_V}")
+
+string(JSON DROP_TOKENS_V GET ${ARISTOS_CONFIG} "drop_tokens")
+message(STATUS "drop_tokens: ${DROP_TOKENS_V}")
+
+string(JSON E_TOP_K_V GET ${ARISTOS_CONFIG} "expert_top_k")
+message(STATUS "expert_top_k: ${E_TOP_K_V}")
+
+string(JSON IS_TRAINING_V GET ${ARISTOS_CONFIG} "is_training")
+message(STATUS "is_training: ${IS_TRAINING_V}")
+
+string(JSON HIDDEN_ACT_V GET ${ARISTOS_CONFIG} "hidden_act")
+message(STATUS "hidden_act: ${HIDDEN_ACT_V}")
+
+string(JSON HIDDEN_SIZE_V GET ${ARISTOS_CONFIG} "hidden_size")
+message(STATUS "hidden_size: ${HIDDEN_SIZE_V}")
+
+string(JSON I_SIZE_V GET ${ARISTOS_CONFIG} "intermediate_size")
+message(STATUS "intermediate_size: ${I_SIZE_V}")
+
+string(JSON MU_BATCH_V GET ${ARISTOS_CONFIG} "micro_batch")
+message(STATUS "micro_batch: ${MU_BATCH_V}")
+
+string(JSON NUM_EXPERTS_V GET ${ARISTOS_CONFIG} "num_experts")
+message(STATUS "num_experts: ${NUM_EXPERTS_V}")
+
+string(JSON SEQ_LEN_V GET ${ARISTOS_CONFIG} "sequence_len")
+message(STATUS "sequence_len: ${SEQ_LEN_V}")
+
+string(JSON DTYPE_V GET ${ARISTOS_CONFIG} "torch_dtype")
+message(STATUS "torch_dtype: ${DTYPE_V}")
+
+target_compile_definitions(cuPlayground
+        PRIVATE
+        PLAY_ARCH=${GPU_ARCH}
+        CAP_FACTOR=${CAP_FACTOR_V}
+        DROP_TOKENS=${DROP_TOKENS_V}
+        E_TOP_K=${E_TOP_K_V}
+        HIDDEN_ACT=${HIDDEN_ACT_V}
+        HIDDEN_SIZE=${HIDDEN_SIZE_V}
+        I_SIZE=${I_SIZE_V}
+        NUM_EXPERTS=${NUM_EXPERTS_V}
+        SEQ_LEN=${SEQ_LEN_V}
+        DTYPE=${DTYPE_V}
 )
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")

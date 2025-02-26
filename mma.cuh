@@ -25,7 +25,7 @@ requires (cute::is_tensor_v<MatrixA>
     && cute::is_tensor_v<MatrixC>
     && cute::is_tensor_v<MatrixD>
     && sharedSize % THREADS == 0)
-__global__ __maxnreg__(128) void deviceCollectiveMMA(
+__global__ __maxnreg__(255) void deviceCollectiveMMA(
     const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD, const bool skip = true) {
     using ElementD = typename decltype(mD)::value_type;
     static_assert(sharedSize % sizeof(ElementD) == 0);
@@ -40,7 +40,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
         static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
         using ElementC = typename BlockGEMM::MatrixCType;
         constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
-        constexpr auto bN = cute::get<0>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
 
         constexpr typename BlockGEMM::MMA tiledMMA{};
         auto accum = cute::partition_fragment_C(tiledMMA, typename BlockGEMM::TilerOut{});
@@ -79,7 +79,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
 
         // Assume unary operator
         constexpr typename BlockGEMM::FusedEpilogue epilogueOp{};
-        constexpr auto elems = sharedSize / (THREADS * sizeof(ElementD));
+        constexpr auto elems = bN;
         static_assert(size(accum) % elems == 0);
         constexpr auto trips = size(accum) / elems;
         // Leverage compiler packing for half-precision values into one register
@@ -146,7 +146,7 @@ __global__ __maxnreg__(128) void deviceCollectiveMMA(
     }
 #endif
 
-#if 1
+#if 0
     if (!threadIdx.x && !skip) {
         cute::print_tensor(mD);
         cute::print_tensor(mA);
@@ -211,9 +211,9 @@ void testCollective() {
     const auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
 
-    constexpr auto gemmSharedSize = (sizeof(inputValueType) * Operation::GEMM::a_size)
+    constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
         + (sizeof(weightValueType) + Operation::GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 32 * 4);
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 64 * 4);
     deviceCollectiveMMA<Operation, sharedSize><<<1, 128, 0, playStream>>>(mA, mB, mC, mD, false);
     CHECK_LAST();
     CHECK_ERROR_EXIT(cudaFree(abc));
@@ -290,7 +290,7 @@ void testP2PCollective() {
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
         + (sizeof(weightValueType) + Operation::GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 32 * 4);
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 64 * 4);
 #if MULTIPLE_TIMING
     for (uint i = 0; i < 128; ++i) {
         deviceCollectiveMMA<Operation, sharedSize, ResultType::network><<<1, 128, sharedSize, playStream>>>

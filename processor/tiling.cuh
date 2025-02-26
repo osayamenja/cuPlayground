@@ -23,7 +23,7 @@
 #define BLOCK_K_HALF 16U
 #define BLOCK_K_FULL 8U
 #define MAX_REGS (BLOCK_M * BLOCK_N) / THREADS
-#define PIPELINE_STAGES 2U
+#define PIPELINE_STAGES 4U
 
 /// Fused, Add, Activate
 template <typename Element, typename ActivationFunction>
@@ -62,27 +62,40 @@ struct isFAA : cuda::std::false_type {};
 template<typename Element, typename ActivationFunction>
 struct isFAA<FAA<Element, ActivationFunction>> : cuda::std::true_type {};
 
-template<typename T>
-using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
-        __half,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::bfloat16_t>,
-        __nv_bfloat16,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e4m3_t>,
-        __nv_fp8_e4m3,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, cute::float_e5m2_t>,
-        __nv_fp8_e5m2, T>>>>;
+template<typename S>
+    struct ToCute {
+    using T = S;
+    static_assert(TensorValueType<T>);
+};
+template<>
+struct ToCute<__half> {
+    using T = cute::half_t;
+};
+template<>
+struct ToCute<__nv_bfloat16> {
+    using T = cute::bfloat16_t;
+};
 
-template<typename T>
-using toCT = cuda::std::conditional_t<cuda::std::is_same_v<T, __half>,
-        cute::half_t,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_bfloat16>,
-        cute::bfloat16_t,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e4m3>,
-        cute::float_e4m3_t,
-    cuda::std::conditional_t<cuda::std::is_same_v<T, __nv_fp8_e5m2>,
-        cute::float_e5m2_t, T>>>>;
+template<typename S>
+requires(TensorValueType<S>)
+struct ToCDx {
+    using T = S;
+};
+template<>
+struct ToCDx<cute::tfloat32_t> {
+    using T = float;
+};
+template<>
+struct ToCDx<cute::half_t> {
+    using T = __half;
+};
+template<>
+struct ToCDx<cute::bfloat16_t> {
+    using T = __nv_bfloat16;
+};
 
 template<unsigned int Arch, typename TC, typename TA=TC, typename TB=TA>
+requires (Arch >= 700)
 struct MMAConfig {
     using mma = cute::TiledMMA<
                 cute::MMA_Atom<cute::UniversalFMA<TC, TA, TB>>,
@@ -146,72 +159,13 @@ struct MMAConfig<800, float, cute::tfloat32_t> {
 };
 
 template <cublasdx::arrangement a, unsigned int midSwizzle, unsigned int sizeK>
-requires((a == cublasdx::arrangement::row_major || a == cublasdx::arrangement::col_major)
-    && (midSwizzle == 2 || midSwizzle == 3) && (sizeK == BLOCK_K_HALF || sizeK == BLOCK_K_FULL))
-struct SwizzleAtom {};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::row_major, 2, BLOCK_K_FULL> {
+requires(a == cublasdx::arrangement::row_major
+    && (midSwizzle == 2 || midSwizzle == 3) && (sizeK >= 8 && sizeK <= 64))
+struct SwizzleAtom {
     using swizzleAtom =  decltype(
-    cute::composition(cute::Swizzle<3,2,3>{},
-                cute::Layout<cute::Shape<cute::_8, cute::_8>,
-                       cute::Stride<cute::_8, cute::_1>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::col_major, 2, BLOCK_K_FULL> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,2,3>{},
-                cute::Layout<cute::Shape <cute::_8, cute::_8>,
-                       cute::Stride< cute::_1,cute::_8>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::row_major, 2, BLOCK_K_HALF> {
-    using swizzleAtom =  decltype(
-    cute::composition(cute::Swizzle<3,2,3>{},
-                cute::Layout<cute::Shape < cute::_8,cute::_16>,
-                       cute::Stride<cute::_16, cute::_1>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::col_major, 2, BLOCK_K_HALF> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,2,3>{},
-                cute::Layout<cute::Shape <cute::_16, cute::_8>,
-                       cute::Stride< cute::_1, cute::_16>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::row_major, 3, BLOCK_K_FULL> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,3,3>{},
-                cute::Layout<cute::Shape < cute::_8,cute::_8>,
-                       cute::Stride<cute::_8, cute::_1>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::col_major, 3, BLOCK_K_FULL> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,3,3>{},
-                cute::Layout<cute::Shape <cute::_8, cute::_8>,
-                       cute::Stride< cute::_1,cute::_8>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::row_major, 3, BLOCK_K_HALF> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,3,3>{},
-                cute::Layout<cute::Shape < cute::_8,cute::_16>,
-                       cute::Stride<cute::_16, cute::_1>>{}));
-};
-
-template<>
-struct SwizzleAtom<cublasdx::arrangement::col_major, 3, BLOCK_K_HALF> {
-    using swizzleAtom =  decltype(
-    composition(cute::Swizzle<3,3,3>{},
-                cute::Layout<cute::Shape <cute::_16, cute::_8>,
-                       cute::Stride< cute::_1,cute::_16>>{}));
+    cute::composition(cute::Swizzle<3, midSwizzle, 3>{},
+                cute::Layout<cute::Shape<cute::_8, cute::Int<sizeK>>,
+                       cute::Stride<cute::Int<sizeK>, cute::_1>>{}));
 };
 
 template<typename Element, unsigned int Arch>
@@ -220,7 +174,7 @@ using copyArch = cuda::std::conditional_t<sizeof(Element) >= 4 && Arch >= 800,
 
 template<typename Element>
 using sCopyLay = cuda::std::conditional_t<sizeof(Element) >= 4,
-cute::AutoVectorizingCopyWithAssumedAlignment<8 * 16 / sizeof(Element)>, cute::SM75_U32x2_LDSM_N>;
+cute::SM75_U32x4_LDSM_N, cute::SM75_U32x2_LDSM_N>;
 
 template<
     typename ElementA,
@@ -230,11 +184,6 @@ template<
     cublasdx::arrangement b = cublasdx::arrangement::row_major  // N
 >
 struct CopyOp {
-    static_assert((a == cublasdx::arrangement::row_major &&
-        b == cublasdx::arrangement::row_major )||
-        (a == cublasdx::arrangement::col_major &&
-            b == cublasdx::arrangement::col_major));
-
     using copyAT = decltype(cute::make_tiled_copy(
         cute::Copy_Atom<copyArch<ElementA, Arch>, ElementA>{},
         cute::Layout<cute::Shape<cute::_16, cute::_8>,
@@ -264,7 +213,7 @@ struct CopyOp {
 };
 
 enum class LayoutOptimization {
-  UseSwizzle,
+    UseSwizzle,
     UseVanilla
 };
 
@@ -272,15 +221,20 @@ template<typename T>
 requires (sizeof(T) == 2 || sizeof(T) == 4)
 using MiddleSwizzle = cute::Int<sizeof(T) == 2 ? 3 : 2>;
 
-template<class GEMM,
-LayoutOptimization lOpt = LayoutOptimization::UseVanilla,
-typename ElementA = toCT<typename GEMM::a_value_type>,
-typename ElementB = toCT<typename GEMM::b_value_type>,
-typename ElementC = toCT<typename GEMM::c_value_type>>
+template<
+    class GEMM,
+    typename ElementA,
+    typename ElementB,
+    typename ElementC,
+    LayoutOptimization lOpt = LayoutOptimization::UseVanilla
+>
 requires (cublasdx::is_complete_blas<GEMM>::value
 && cublasdx::sm_of<GEMM>::value >= MIN_ARCH
 && cublasdx::sm_of<GEMM>::value < 900)
 struct CollectiveMMAConfig{
+    static_assert(cublasdx::arrangement_of<GEMM>::a == cublasdx::arrangement::row_major &&
+        cublasdx::arrangement_of<GEMM>::b == cublasdx::arrangement::row_major,
+        "Only row-major is supported for either A or B");
     using ldA = cuda::std::conditional_t<cublasdx::arrangement_of<GEMM>::a == cublasdx::row_major,
     cute::Int<cublasdx::size_of<GEMM>::k>, cute::Int<cublasdx::size_of<GEMM>::m>>; // A: (m,k)
     using ldB = cuda::std::conditional_t<cublasdx::arrangement_of<GEMM>::b == cublasdx::row_major,
@@ -327,9 +281,6 @@ struct CollectiveMMAConfig{
 
     using mma_t = typename MMAConfig<cublasdx::sm_of<GEMM>::value, ElementC, ElementA,
     ElementB>::mma;
-    using dispatch = cuda::std::conditional_t<cublasdx::sm_of<GEMM>::value < 800,
-    cutlass::gemm::MainloopSm70TwoStageUnpredicated,
-    cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>>;
 };
 
 template<
@@ -360,10 +311,12 @@ struct BlockMM {
                                     cute::Int<cublasdx::size_of<GEMM>::n>,
                                     cute::Int<cublasdx::size_of<GEMM>::k>>;
     using TilerOut = cute::Shape<cute::Int<cublasdx::size_of<GEMM>::m>, cute::Int<cublasdx::size_of<GEMM>::n>>;
-    using Parameters = CollectiveMMAConfig<GEMM, LayoutOptimization::UseSwizzle>;
+    using Parameters = CollectiveMMAConfig<GEMM, ElementA, ElementB, ElementC, LayoutOptimization::UseSwizzle>;
     using MMA = typename Parameters::mma_t;
     using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-        typename Parameters::dispatch,
+        cuda::std::conditional_t<cublasdx::sm_of<GEMM>::value < 800,
+                    cutlass::gemm::MainloopSm70TwoStageUnpredicated,
+                        cutlass::gemm::MainloopSm80CpAsyncUnpredicated<PIPELINE_STAGES>>,
         BlockTiler,
         ElementA,
         cute::Underscore,

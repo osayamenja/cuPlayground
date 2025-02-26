@@ -75,6 +75,18 @@ template<typename V>
         cuda::std::is_same_v<V, cute::float_e4m3_t> ||
         cuda::std::is_same_v<V, cute::float_e5m2_t>;
 
+template <class T>
+struct isTensor : cuda::std::false_type {};
+template <class Engine, class Layout>
+requires(TensorValueType<typename Engine::value_type>)
+struct isTensor<cute::Tensor<Engine,Layout>> : cuda::std::true_type {};
+template <class Engine, class Layout>
+requires(TensorValueType<typename Engine::value_type>)
+struct isTensor<const cute::Tensor<Engine,Layout>> : cuda::std::true_type {};
+
+template<typename T>
+    concept isMatrix = isTensor<T>::value && cuda::std::is_same_v<decltype(rank(T{})), cute::Int<2>>;
+
 template<typename T>
     using toCDX = cuda::std::conditional_t< cuda::std::is_same_v<T, cute::half_t>,
             __half,

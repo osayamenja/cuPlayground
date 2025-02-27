@@ -5,6 +5,7 @@
 #ifndef MMA_CUH
 #define MMA_CUH
 
+#include <cuda/std/array>
 #include <cuda/std/type_traits>
 #include <cublasdx.hpp>
 #include <cute/tensor.hpp>
@@ -17,9 +18,22 @@ enum class ResultType {
     network
 };
 
+enum class ReleaseType {
+    stable,
+    experimental
+};
+
 #define MULTIPLE_TIMING 0
-template<class BlockGEMM, unsigned int sharedSize = 16 * 1024, ResultType r = ResultType::local,
-typename MatrixA, typename MatrixB, typename MatrixC, typename MatrixD>
+template<
+    class BlockGEMM,
+    unsigned int sharedSize = 16 * 1024,
+    ResultType r = ResultType::local,
+    ReleaseType rT = ReleaseType::stable,
+    typename MatrixA,
+    typename MatrixB,
+    typename MatrixC,
+    typename MatrixD
+>
 requires (cute::is_tensor_v<MatrixA>
     && cute::is_tensor_v<MatrixB>
     && cute::is_tensor_v<MatrixC>
@@ -70,11 +84,11 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             cute::Underscore{},
             threadIdx.x,
             CAST_TO(char, scratch));
+        __syncthreads();
 
         // Epilogue
         //const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
         const auto tDgD = tiledMMA.get_slice(threadIdx.x).partition_C(gD);
-        constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type, ElementC>{};
         constexpr auto gDLoadOp = cutlass::NumericConverter<ElementC, ElementD>{};
 
         // Assume unary operator
@@ -83,48 +97,99 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         static_assert(size(accum) % elems == 0);
         constexpr auto trips = size(accum) / elems;
         // Leverage compiler packing for half-precision values into one register
-        cutlass::AlignedArray<ElementD, elems> rScratch{};
+        cuda::std::array<ElementD, elems> rScratch{};
 
-        // Prefetch from global to shared memory
-        #pragma unroll
-        for (int j = 0; j < elems; ++j) {
-            scratch[threadIdx.x + j * THREADS] = tDgD(j);
-        }
+        // vector type for vectorized copy
+        using VT = cuda::std::conditional_t<sizeof(ElementD) == 2, uint32_t, uint64_t>;
+        constexpr auto vZ = 2U;
+        constexpr auto eVz = elems / 2U;
+        // collectively copy from global to shared
+        constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
+        const auto sC = cute::make_tensor(cute::make_smem_ptr(scratch), sCLay);
+        const auto rIdx = threadIdx.x / elems * elems;
+        const auto cIdx = threadIdx.x % elems;
+        const auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
+        const auto tCrC = cute::make_tensor(CAST_TO(ElementD, accum.data()),
+            cute::Layout<cute::Shape<cute::Int<size(accum)>, cute::_1>>{});
 
-        #pragma unroll
-        for (unsigned int i = 0; i < trips; ++i) {
+        if constexpr (rT == ReleaseType::experimental) {
             #pragma unroll
-            for (unsigned int j = 0; j < elems; ++j) {
-                rScratch[j] = scratch[threadIdx.x + j * THREADS];
-                if (i + 1 < trips) {
-                    // Eagerly start loads for the next batch, if needed
-                    scratch[threadIdx.x + j * THREADS] = tDgD(j + (i + 1) * elems);
+            for (uint i = 0; i < trips; ++i) {
+                // global -> shared
+                #pragma unroll
+                for (uint j = 0; j < elems; ++j) {
+                    sC(rIdx + j, cIdx) = gD(rIdx + j, cIdx + i * elems);
+                }
+                __syncthreads();
+                // shared -> registers
+                #pragma unroll
+                for (uint j = 0; j < eVz; ++j) {
+                    CAST_TO(VT, rScratch.data())[j] = *CONST_CAST_TO(VT, &tCsC(j * vZ));
+                }
+                #pragma unroll
+                for (int j = 0; j < elems; ++j) {
+                    accum(j + i * elems) = epilogueOp(accum(j + i * elems), gDLoadOp(rScratch[j]));
                 }
             }
-            // Fused Bias Add and Activation Function on register fragment
-            // Also fuses copy to GMEM.
+        }
+        else {
+            // Prefetch from global to shared memory with vector accesses
             #pragma unroll
             for (int j = 0; j < elems; ++j) {
-                accum(j + i * elems) = epilogueOp(accum(j + i * elems), gDLoadOp(rScratch[j]));
+                scratch[threadIdx.x + j * THREADS] = tDgD(j);
+            }
+
+            #pragma unroll
+            for (unsigned int i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; ++j) {
+                    rScratch[j] = scratch[threadIdx.x + j * THREADS];
+                    if (i + 1 < trips) {
+                        // Eagerly start loads for the next batch, if needed
+                        scratch[threadIdx.x + j * THREADS] = tDgD(j + (i + 1) * elems);
+                    }
+                }
+                // Fused Bias Add and Activation Function on register fragment
+                #pragma unroll
+                for (int j = 0; j < elems; ++j) {
+                    accum(j + i * elems) = epilogueOp(accum(j + i * elems), gDLoadOp(rScratch[j]));
+                }
             }
         }
 
         __syncthreads();
-        constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
-        const auto sC = cute::make_tensor(cute::make_smem_ptr(scratch), sCLay);
-        const auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
-        const auto rIdx = threadIdx.x / elems * elems;
-        const auto cIdx = threadIdx.x % elems;
-        #pragma unroll
-        for (unsigned int i = 0; i < trips; ++i) {
+        if constexpr (rT == ReleaseType::experimental) {
+            constexpr cutlass::NumericArrayConverter<ElementD, ElementC, vZ> op{};
+            using ST = cutlass::AlignedArray<ElementC, vZ>;
+            using RT = cutlass::AlignedArray<ElementD, vZ>;
             #pragma unroll
-            for (unsigned int j = 0; j < elems; ++j) {
-                tCsC(j) = gCStoreOp(accum(j + i * elems));
+            for (unsigned int i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; j += vZ) {
+                    // inelegant way to enforce vector stores to shared memory
+                    *CAST_TO(RT, &tCsC(j)) = *CAST_TO(RT,
+                        op(*CONST_CAST_TO(ST, &accum(j + i * elems))).data());
+                }
+                __syncthreads();
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; ++j) {
+                    gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
+                }
             }
-            __syncthreads();
+        }
+        else {
+            constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type, ElementC>{};
             #pragma unroll
-            for (unsigned int j = 0; j < elems; ++j) {
-                gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
+            for (unsigned int i = 0; i < trips; ++i) {
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; ++j) {
+                    tCsC(j) = gCStoreOp(accum(j + i * elems));
+                }
+                __syncthreads();
+                #pragma unroll
+                for (unsigned int j = 0; j < elems; ++j) {
+                    gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
+                }
             }
         }
         __syncthreads();
@@ -148,9 +213,9 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 
 #if 0
     if (!threadIdx.x && !skip) {
-        cute::print_tensor(mD);
+        /*cute::print_tensor(mD);
         cute::print_tensor(mA);
-        cute::print_tensor(mB);
+        cute::print_tensor(mB);*/
         cute::print_tensor(mC);
     }
 #endif
@@ -200,21 +265,22 @@ void testCollective() {
 
     CHECK_ERROR_EXIT(cudaMemcpyAsync(abc, data, len, cudaMemcpyHostToDevice, playStream));
 
-    const auto mA = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc)),
+    const auto mA = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc)),
         make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
     const auto mB = make_tensor(cute::make_gmem_ptr(
-        CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+        CONST_CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
     const auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
 
     // bias vector (1, N) broadcast to (M, N)
-    const auto mD = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abcSize)),
+    const auto mD = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc + abcSize)),
         make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
         + (sizeof(weightValueType) + Operation::GEMM::b_size);
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 64 * 4);
-    deviceCollectiveMMA<Operation, sharedSize><<<1, 128, 0, playStream>>>(mA, mB, mC, mD, false);
+    deviceCollectiveMMA<Operation, sharedSize, ResultType::local, ReleaseType::experimental><<<1, 128, 0, playStream>>>
+    (mA, mB, mC, mD, false);
     CHECK_LAST();
     CHECK_ERROR_EXIT(cudaFree(abc));
     free(data);

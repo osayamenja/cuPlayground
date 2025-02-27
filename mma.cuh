@@ -5,6 +5,7 @@
 #ifndef MMA_CUH
 #define MMA_CUH
 
+#include <cooperative_groups/memcpy_async.h>
 #include <cuda/std/array>
 #include <cuda/std/type_traits>
 #include <cublasdx.hpp>
@@ -55,6 +56,7 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         using ElementC = typename BlockGEMM::MatrixCType;
         constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
         constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
 
         constexpr typename BlockGEMM::MMA tiledMMA{};
         auto accum = cute::partition_fragment_C(tiledMMA, typename BlockGEMM::TilerOut{});
@@ -73,6 +75,15 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
         int k_tile_count = size<2>(gA);
 
+        static_assert(cuda::std::is_same_v<typename BlockGEMM::MatrixAType, typename BlockGEMM::MatrixBType> &&
+            cuda::std::is_same_v<typename BlockGEMM::MatrixAType, ElementD>);
+        // Asynchronously copy bias from global to shared memory
+        if constexpr (rT == ReleaseType::experimental) {
+            cooperative_groups::memcpy_async(cooperative_groups::this_thread(),
+                CAST_TO(uint4, scratch + threadIdx.x * bN),
+                CONST_CAST_TO(uint4, &gD(threadIdx.x, 0)),
+                bN * sizeof(ElementD));
+        }
         cute::clear(accum);
         typename BlockGEMM::CollectiveMainloop collective_mma{};
         collective_mma(
@@ -83,8 +94,7 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             k_tile_iter, k_tile_count,
             cute::Underscore{},
             threadIdx.x,
-            CAST_TO(char, scratch));
-        __syncthreads();
+            CAST_TO(char, scratch + bM * bN));
 
         // Epilogue
         //const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -101,8 +111,6 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 
         // vector type for vectorized copy
         using VT = cuda::std::conditional_t<sizeof(ElementD) == 2, uint32_t, uint64_t>;
-        constexpr auto vZ = 2U;
-        constexpr auto eVz = elems / 2U;
         // collectively copy from global to shared
         constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
         const auto sC = cute::make_tensor(cute::make_smem_ptr(scratch), sCLay);
@@ -113,14 +121,13 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             cute::Layout<cute::Shape<cute::Int<size(accum)>, cute::_1>>{});
 
         if constexpr (rT == ReleaseType::experimental) {
+            constexpr auto vZ = 2U;
+            constexpr auto eVz = elems / vZ;
+            wait(cooperative_groups::this_thread());
+            __syncthreads();
+            // Data should be available in shared memory now
             #pragma unroll
             for (uint i = 0; i < trips; ++i) {
-                // global -> shared
-                #pragma unroll
-                for (uint j = 0; j < elems; ++j) {
-                    sC(rIdx + j, cIdx) = gD(rIdx + j, cIdx + i * elems);
-                }
-                __syncthreads();
                 // shared -> registers
                 #pragma unroll
                 for (uint j = 0; j < eVz; ++j) {
@@ -158,38 +165,17 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         }
 
         __syncthreads();
-        if constexpr (rT == ReleaseType::experimental) {
-            constexpr cutlass::NumericArrayConverter<ElementD, ElementC, vZ> op{};
-            using ST = cutlass::AlignedArray<ElementC, vZ>;
-            using RT = cutlass::AlignedArray<ElementD, vZ>;
+        constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type, ElementC>{};
+        #pragma unroll
+        for (unsigned int i = 0; i < trips; ++i) {
             #pragma unroll
-            for (unsigned int i = 0; i < trips; ++i) {
-                #pragma unroll
-                for (unsigned int j = 0; j < elems; j += vZ) {
-                    // inelegant way to enforce vector stores to shared memory
-                    *CAST_TO(RT, &tCsC(j)) = *CAST_TO(RT,
-                        op(*CONST_CAST_TO(ST, &accum(j + i * elems))).data());
-                }
-                __syncthreads();
-                #pragma unroll
-                for (unsigned int j = 0; j < elems; ++j) {
-                    gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
-                }
+            for (unsigned int j = 0; j < elems; ++j) {
+                tCsC(j) = gCStoreOp(accum(j + i * elems));
             }
-        }
-        else {
-            constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type, ElementC>{};
+            __syncthreads();
             #pragma unroll
-            for (unsigned int i = 0; i < trips; ++i) {
-                #pragma unroll
-                for (unsigned int j = 0; j < elems; ++j) {
-                    tCsC(j) = gCStoreOp(accum(j + i * elems));
-                }
-                __syncthreads();
-                #pragma unroll
-                for (unsigned int j = 0; j < elems; ++j) {
-                    gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
-                }
+            for (unsigned int j = 0; j < elems; ++j) {
+                gC(rIdx + j, cIdx + i * elems) = sC(rIdx + j, cIdx);
             }
         }
         __syncthreads();
@@ -278,7 +264,7 @@ void testCollective() {
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
         + (sizeof(weightValueType) + Operation::GEMM::b_size);
-    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 64 * 4);
+    constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 48 * 1024);
     deviceCollectiveMMA<Operation, sharedSize, ResultType::local, ReleaseType::experimental><<<1, 128, 0, playStream>>>
     (mA, mB, mC, mD, false);
     CHECK_LAST();

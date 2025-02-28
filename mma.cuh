@@ -26,6 +26,9 @@ enum class ReleaseType {
 
 #define MULTIPLE_TIMING 0
 template<
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
     class BlockGEMM,
     unsigned int sharedSize = 16 * 1024,
     ResultType r = ResultType::local,
@@ -57,33 +60,26 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
         constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
         constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
-
+        static_assert(M % bM == 0 && N % bN == 0 && K % bK == 0);
         constexpr typename BlockGEMM::MMA tiledMMA{};
         auto accum = cute::partition_fragment_C(tiledMMA, typename BlockGEMM::TilerOut{});
         static_assert(cuda::std::is_same_v<ElementC, typename decltype(accum)::value_type>);
-        // Get the appropriate blocks for this thread block
-        // use problem shape instead, p_MNK = (cute::ceil_div(M, bM), cute::ceil_div(N, bN), K)
-        //auto M = cute::get<0>(mC.shape());
-        //auto N = cute::get<1>(mC.shape());
-        const auto cta_coordX = cute::idx2crd(blockIdx.x, cute::Shape(cute::ceil_div(cute::get<0>(mC.shape()), bM),
-            cute::ceil_div(cute::get<1>(mC.shape()), bN)));
+        constexpr auto tM = M / bM;
+        constexpr auto tN = N / bN;
+        constexpr auto tK = K / bK;
+        // blockIdx == tileIdx
+        const auto cta_coordX = cute::idx2crd(blockIdx.x,
+            cute::Shape<cute::Int<tM>, cute::Int<tN>>{},
+                cute::Stride<cute::Int<tM>, cute::_1>{});
         const auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
         const auto gA = local_tile(mA, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
         const auto gB = local_tile(mB, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
         const auto gC = local_tile(mC, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
         const auto gD = local_tile(mD, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
-        auto k_tile_iter = cute::make_coord_iterator(size<2>(gA));
-        int k_tile_count = size<2>(gA);
+        const auto k_tile_iter = cute::make_coord_iterator(tK);
 
         static_assert(cuda::std::is_same_v<typename BlockGEMM::MatrixAType, typename BlockGEMM::MatrixBType> &&
             cuda::std::is_same_v<typename BlockGEMM::MatrixAType, ElementD>);
-        // Asynchronously copy bias from global to shared memory
-        if constexpr (rT == ReleaseType::experimental) {
-            cooperative_groups::memcpy_async(cooperative_groups::this_thread(),
-                CAST_TO(uint4, scratch + threadIdx.x * bN),
-                CONST_CAST_TO(uint4, &gD(threadIdx.x, 0)),
-                bN * sizeof(ElementD));
-        }
         cute::clear(accum);
         typename BlockGEMM::CollectiveMainloop collective_mma{};
         collective_mma(
@@ -91,10 +87,10 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             gA,
             gB,
             accum,
-            k_tile_iter, k_tile_count,
+            k_tile_iter, tK,
             cute::Underscore{},
             threadIdx.x,
-            CAST_TO(char, scratch + bM * bN));
+            CAST_TO(char, scratch));
 
         // Epilogue
         //const auto tCgC = tiledMMA.get_slice(threadIdx.x).partition_C(gC);
@@ -123,11 +119,15 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         if constexpr (rT == ReleaseType::experimental) {
             constexpr auto vZ = 2U;
             constexpr auto eVz = elems / vZ;
-            wait(cooperative_groups::this_thread());
-            __syncthreads();
             // Data should be available in shared memory now
             #pragma unroll
             for (uint i = 0; i < trips; ++i) {
+                // global -> shared
+                #pragma unroll
+                for (uint j = 0; j < elems; ++j) {
+                    sC(rIdx + j, cIdx) = gD(rIdx + j, cIdx + i * elems);
+                }
+                __syncthreads();
                 // shared -> registers
                 #pragma unroll
                 for (uint j = 0; j < eVz; ++j) {
@@ -140,10 +140,11 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             }
         }
         else {
+            using LT =  cuda::std::conditional_t<sizeof(ElementD) == 2, uint16_t, uint32_t>;
             // Prefetch from global to shared memory with vector accesses
             #pragma unroll
             for (int j = 0; j < elems; ++j) {
-                scratch[threadIdx.x + j * THREADS] = tDgD(j);
+                CAST_TO(LT, scratch)[threadIdx.x + j * THREADS] = __ldg(CONST_CAST_TO(LT, &tDgD(j)));
             }
 
             #pragma unroll
@@ -192,8 +193,8 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
         clocked += static_cast<float>(end - start) / static_cast<float>(rounds);
     }
-    if (!threadIdx.x && !skip) {
-        printf("Duration was %fus\n", clocked / 1000.0f);
+    if (!skip && !threadIdx.x) {
+        printf("Block %u, Duration was %fus\n", blockIdx.x, clocked / 1000.0f);
     }
 #endif
 
@@ -210,11 +211,11 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 __host__ __forceinline__
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
-    constexpr auto M = 128;
-    constexpr auto N = 64;
-    constexpr auto K = 64;
+    constexpr auto M = 1280;
+    constexpr auto N = 1280;
+    constexpr auto K = 4096;
 
-    using inputValueType = cute::tfloat32_t;
+    using inputValueType = cute::half_t;
     using outValueType = inputValueType;
     using weightValueType = inputValueType;
     using accumulateType = float;
@@ -252,27 +253,34 @@ void testCollective() {
     CHECK_ERROR_EXIT(cudaMemcpyAsync(abc, data, len, cudaMemcpyHostToDevice, playStream));
 
     const auto mA = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc)),
-        make_layout(cute::make_shape(M, K), cute::make_stride(K, 1)));
+        cute::Layout<cute::Shape<cute::Int<M>, cute::Int<K>>,cute::Stride<cute::Int<K>, cute::_1>>{});
     const auto mB = make_tensor(cute::make_gmem_ptr(
-        CONST_CAST_TO(weightValueType, abc + aSize)), make_layout(cute::make_shape(N, K), cute::make_stride(K, 1)));
+        CONST_CAST_TO(weightValueType, abc + aSize)),
+        cute::Layout<cute::Shape<cute::Int<N>, cute::Int<K>>,cute::Stride<cute::Int<K>, cute::_1>>{});
     const auto mC = make_tensor(cute::make_gmem_ptr(CAST_TO(inputValueType, abc + abSize)),
-        make_layout(cute::make_shape(M, N), cute::make_stride(N, 1)));
+        cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,cute::Stride<cute::Int<N>, cute::_1>>{});
 
     // bias vector (1, N) broadcast to (M, N)
     const auto mD = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc + abcSize)),
-        make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
+        cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,cute::Stride<cute::_0, cute::_1>>{});
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
-        + (sizeof(weightValueType) + Operation::GEMM::b_size);
+        + (sizeof(weightValueType) * Operation::GEMM::b_size);
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 48 * 1024);
-    deviceCollectiveMMA<Operation, sharedSize, ResultType::local, ReleaseType::experimental><<<1, 128, 0, playStream>>>
-    (mA, mB, mC, mD, false);
+    constexpr auto blocks = (M / cute::get<0>(Operation::BlockTiler{})) * (N / cute::get<1>(Operation::BlockTiler{}));
+    #if MULTIPLE_TIMING
+    for (uint i = 0; i < 128; ++i) {
+        deviceCollectiveMMA<M, N, K, Operation, sharedSize><<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD);
+    }
+    #endif
+    deviceCollectiveMMA<M, N, K, Operation, sharedSize, ResultType::local>
+    <<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD, false);
     CHECK_LAST();
     CHECK_ERROR_EXIT(cudaFree(abc));
     free(data);
 }
 
-__host__ __forceinline__
+/*__host__ __forceinline__
 void testP2PCollective() {
     CHECK_ERROR_EXIT(cudaSetDevice(0));
     CHECK_ERROR_EXIT(cudaDeviceEnablePeerAccess(1, 0));
@@ -341,15 +349,15 @@ void testP2PCollective() {
         make_layout(cute::make_shape(M, N), cute::make_stride(0, 1)));
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
-        + (sizeof(weightValueType) + Operation::GEMM::b_size);
+        + (sizeof(weightValueType) * Operation::GEMM::b_size);
     constexpr auto sharedSize = cute::max(gemmSharedSize * PIPELINE_STAGES, 128 * 64 * 4);
 #if MULTIPLE_TIMING
     for (uint i = 0; i < 128; ++i) {
-        deviceCollectiveMMA<Operation, sharedSize, ResultType::network><<<1, 128, sharedSize, playStream>>>
+        deviceCollectiveMMA<M, N, K, Operation, sharedSize, ResultType::network><<<1, 128, 0, playStream>>>
         (mA, mB, mC, mD);
     }
 #endif
-    deviceCollectiveMMA<Operation, sharedSize, ResultType::network><<<1, 128, sharedSize, playStream>>>
+    deviceCollectiveMMA<M, N, K, Operation, sharedSize, ResultType::network><<<1, 128, 0, playStream>>>
         (mA, mB, mC, mD, false);
     CHECK_ERROR_EXIT(cudaPeekAtLastError());
     // wait for kernel to complete
@@ -366,6 +374,6 @@ void testP2PCollective() {
     CHECK_ERROR_EXIT(cudaPeekAtLastError());
     CHECK_ERROR_EXIT(cudaStreamSynchronize(playStream));
     free(data);
-}
+}*/
 
 #endif //MMA_CUH

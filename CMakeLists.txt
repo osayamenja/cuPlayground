@@ -133,7 +133,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 target_link_libraries(cuPlayground PRIVATE "${TORCH_LIBRARIES}")
 
 target_link_libraries(cuPlayground PRIVATE mathdx::cublasdx)
-target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::nvml CUDA::nvtx3)
+target_link_libraries(cuPlayground PRIVATE CUDA::cudart CUDA::cuda_driver CUDA::nvml CUDA::nvtx3 CUDA::curand_static)
 find_package(NVSHMEM REQUIRED HINTS "$ENV{NVSHMEM_HOME}/lib/cmake/nvshmem")
 target_link_libraries(cuPlayground PRIVATE nvshmem::nvshmem)
 

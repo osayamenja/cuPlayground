@@ -24,7 +24,7 @@ enum class ReleaseType {
     experimental
 };
 
-#define MULTIPLE_TIMING 0
+#define MULTIPLE_TIMING 1
 template<
     unsigned int M,
     unsigned int N,
@@ -103,10 +103,10 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         static_assert(size(accum) % elems == 0);
         constexpr auto trips = size(accum) / elems;
         // Leverage compiler packing for half-precision values into one register
-        cuda::std::array<ElementD, elems> rScratch{};
+        cutlass::AlignedArray<ElementD, elems> rScratch{};
 
         // vector type for vectorized copy
-        using VT = cuda::std::conditional_t<sizeof(ElementD) == 2, uint32_t, uint64_t>;
+        using VT = uint32_t;
         // collectively copy from global to shared
         constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
         const auto sC = cute::make_tensor(cute::make_smem_ptr(scratch), sCLay);
@@ -117,7 +117,7 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
             cute::Layout<cute::Shape<cute::Int<size(accum)>, cute::_1>>{});
 
         if constexpr (rT == ReleaseType::experimental) {
-            constexpr auto vZ = 2U;
+            constexpr auto vZ = sizeof(ElementD) / sizeof(VT);
             constexpr auto eVz = elems / vZ;
             // Data should be available in shared memory now
             #pragma unroll

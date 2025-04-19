@@ -24,7 +24,159 @@ enum class ReleaseType {
     experimental
 };
 
-#define MULTIPLE_TIMING 1
+#define MULTIPLE_TIMING 0
+template<
+    unsigned int M,
+    unsigned int N,
+    unsigned int K,
+    class BlockGEMM,
+    unsigned int sharedSize = 32 * 1024,
+    ResultType r = ResultType::local,
+    ReleaseType rT = ReleaseType::stable,
+    typename MatrixA,
+    typename MatrixB,
+    typename MatrixC,
+    typename MatrixD
+>
+requires (cute::is_tensor_v<MatrixA>
+    && cute::is_tensor_v<MatrixB>
+    && cute::is_tensor_v<MatrixC>
+    && cute::is_tensor_v<MatrixD>
+    && sharedSize % THREADS == 0)
+__global__ __maxnreg__(255) void fGET(
+    const MatrixA mA, const MatrixB mB, const MatrixC mC, const MatrixD mD, const bool skip = true) {
+    using Element = typename decltype(mD)::value_type;
+    static_assert(sharedSize % sizeof(Element) == 0);
+    __shared__ __align__(16) Element scratch[sharedSize / sizeof(Element)];
+#if MULTIPLE_TIMING
+    float clocked = 0.0f;
+    constexpr auto rounds = 8;
+    for (uint k = 0; k < rounds; ++k) {
+        uint64_t start = 0, end = 0;
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(start)::);
+#endif
+        static_assert(rank(mA) == 2 && rank(mB) == 2 && rank(mC) == 2 && rank(mD) == 2);
+        using ElementC = typename BlockGEMM::MatrixCType;
+        constexpr auto bM = cute::get<0>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bN = cute::get<1>(typename BlockGEMM::BlockTiler{});
+        constexpr auto bK = cute::get<2>(typename BlockGEMM::BlockTiler{});
+        static_assert(M % bM == 0 && N % bN == 0 && K % bK == 0);
+        constexpr typename BlockGEMM::MMA tiledMMA{};
+        auto accum = cute::partition_fragment_C(tiledMMA, typename BlockGEMM::TilerOut{});
+        static_assert(cuda::std::is_same_v<ElementC, typename decltype(accum)::value_type>);
+        constexpr auto tM = M / bM;
+        constexpr auto tN = N / bN;
+        constexpr auto tK = K / bK;
+        // blockIdx == tileIdx
+        const auto cta_coordX = cute::idx2crd(blockIdx.x,
+            cute::Shape<cute::Int<tM>, cute::Int<tN>>{},
+                cute::Stride<cute::Int<tM>, cute::_1>{});
+        const auto cta_coord = cute::make_coord(cute::get<0>(cta_coordX), cute::get<1>(cta_coordX), cute::_);
+        const auto gA = local_tile(mA, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1, cute::X,cute::_1>{});  // (BLK_M,BLK_K,k)
+        const auto gB = local_tile(mB, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step< cute::X,cute::_1,cute::_1>{});  // (BLK_N,BLK_K,k)
+        const auto gC = local_tile(mC, typename BlockGEMM::BlockTiler{}, cta_coord, cute::Step<cute::_1,cute::_1, cute::X>{});  // (BLK_M,BLK_N)
+        const auto k_tile_iter = cute::make_coord_iterator(tK);
+
+        static_assert(cuda::std::is_same_v<typename BlockGEMM::MatrixAType, typename BlockGEMM::MatrixBType> &&
+            cuda::std::is_same_v<typename BlockGEMM::MatrixAType, Element>);
+        cute::clear(accum);
+        typename BlockGEMM::CollectiveMainloop collective_mma{};
+
+        constexpr auto threads = 128;
+        static_assert(sharedSize >= (threads * 2 + sizeof(Element)) * bN);
+        const auto biasCoord = idx2crd(blockIdx.x, cute::Shape<cute::_1, cute::Int<tN>>{},
+            cute::Stride<cute::Int<bN>, cute::_1>{});
+        const auto gD = cute::local_tile(mD,
+            cute::Shape<cute::_1, cute::Int<bN>>{}, cute::get<1>(biasCoord));
+        static_assert(threads % bN == 0);
+        if (threadIdx.x < bN) {
+            using LT =  cuda::std::conditional_t<sizeof(Element) == 2, uint16_t, uint32_t>;
+            CAST_TO(LT, scratch)[threadIdx.x] = __ldg(CONST_CAST_TO(LT, &gD(threadIdx.x)));
+        }
+        collective_mma(
+            accum,
+            gA,
+            gB,
+            accum,
+            k_tile_iter, tK,
+            cute::Underscore{},
+            threadIdx.x,
+            CAST_TO(char, scratch + bN));
+        /// There is a block-wide barrier at the end of the above ^
+
+        // Epilogue
+        constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type,
+                                                    typename decltype(accum)::value_type>{};
+        constexpr auto gDLoadOp = cutlass::NumericConverter<typename decltype(accum)::value_type,
+                                                    Element>{};
+        // Assume elementwise operator
+        typename BlockGEMM::FusedEpilogue epilogueOp{};
+        constexpr auto elems = bN;
+        constexpr auto trips = size(accum) / elems;
+        // copy single bias value
+        ElementC rB[trips];
+        #pragma unroll
+        for (uint i = 0 ; i < trips; ++i) {
+            rB[i] = gDLoadOp(scratch[threadIdx.x % elems + i * elems]);
+        }
+        constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{},
+            cute::LayoutRight{});
+        const auto sC = cute::make_tensor(cute::make_smem_ptr(CAST_TO(ElementC, scratch + bN)), sCLay);
+        const auto rC = cute::make_tensor(cute::make_rmem_ptr(CAST_TO(Element, accum.data())),
+            cute::Layout<cute::Shape<cute::_1, cute::Int<bN>>,
+                cute::Stride<cute::Int<bN>, cute::_1>>{});
+        const auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
+
+        // Reorder to blocked arrangement
+        #pragma unroll
+        for (unsigned int i = 0; i < trips; ++i) {
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                tCsC(j) = accum(j + i * elems);
+            }
+            __syncthreads();
+            const auto rIdx = threadIdx.x / elems * elems;
+            const auto cIdx = threadIdx.x % elems;
+            #pragma unroll
+            for (unsigned int j = 0; j < elems; ++j) {
+                accum(j + i * elems) = sC(rIdx + j, cIdx);
+            }
+        }
+
+        // apply epilogue
+        #pragma unroll
+        for (uint i = 0; i < trips; ++i) {
+            #pragma unroll
+            for (int j = 0; j < elems; ++j) {
+                rC(j + i * elems) = gCStoreOp(epilogueOp(accum(j + i * elems), rB[i]));
+            }
+        }
+
+        const auto rIdx = threadIdx.x / bN * bN;
+        const auto cIdx = threadIdx.x % bN;
+        // Coalesced copy from registers to global memory
+        #pragma unroll
+        for (unsigned int j = 0; j < bN; ++j) {
+            gC(rIdx + j, cIdx) = rC(j);
+        }
+#if MULTIPLE_TIMING
+        asm volatile("mov.u64 %0, %%globaltimer;": "=l"(end)::);
+        clocked += static_cast<float>(end - start) / static_cast<float>(rounds);
+    }
+    if (!skip && !threadIdx.x) {
+        printf("Block %u, Duration was %fus\n", blockIdx.x, clocked / 1000.0f);
+    }
+#endif
+
+#if 0
+    if (!threadIdx.x && !skip) {
+        cute::print_tensor(mD);
+        //cute::print_tensor(mA);
+        //cute::print_tensor(mB);
+        cute::print_tensor(mC);
+    }
+#endif
+}
 template<
     unsigned int M,
     unsigned int N,
@@ -110,9 +262,11 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
         // collectively copy from global to shared
         constexpr auto sCLay = cute::make_layout(cute::Shape<cute::Int<bM>, cute::Int<elems>>{}, cute::LayoutRight{});
         const auto sC = cute::make_tensor(cute::make_smem_ptr(scratch), sCLay);
+        const auto sC2 = cute::make_tensor(cute::make_smem_ptr(CAST_TO(float, scratch)), sCLay);
         const auto rIdx = threadIdx.x / elems * elems;
         const auto cIdx = threadIdx.x % elems;
         const auto tCsC = tiledMMA.get_slice(threadIdx.x).partition_C(sC);
+        const auto tCsC2 = tiledMMA.get_slice(threadIdx.x).partition_C(sC2);
         const auto tCrC = cute::make_tensor(CAST_TO(ElementD, accum.data()),
             cute::Layout<cute::Shape<cute::Int<size(accum)>, cute::_1>>{});
 
@@ -167,11 +321,17 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 
         __syncthreads();
         constexpr auto gCStoreOp = cutlass::NumericConverter<typename decltype(gC)::value_type, ElementC>{};
+        static_assert(cuda::std::is_same_v<typename decltype(accum)::value_type, float>);
         #pragma unroll
         for (unsigned int i = 0; i < trips; ++i) {
             #pragma unroll
             for (unsigned int j = 0; j < elems; ++j) {
-                tCsC(j) = gCStoreOp(accum(j + i * elems));
+                //tCsC(j) = gCStoreOp(accum(j + i * elems));
+                tCsC2(j) = accum(j + i * elems);
+            }
+            __syncthreads();
+            if (!threadIdx.x) {
+                print_tensor(sC2);
             }
             __syncthreads();
             #pragma unroll
@@ -200,9 +360,9 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 
 #if 0
     if (!threadIdx.x && !skip) {
-        /*cute::print_tensor(mD);
+        cute::print_tensor(mD);
         cute::print_tensor(mA);
-        cute::print_tensor(mB);*/
+        cute::print_tensor(mB);
         cute::print_tensor(mC);
     }
 #endif
@@ -211,11 +371,11 @@ __global__ __maxnreg__(255) void deviceCollectiveMMA(
 __host__ __forceinline__
 void testCollective() {
     const auto playStream = cudaStreamPerThread;
-    constexpr auto M = 1280;
-    constexpr auto N = 1280;
+    constexpr auto M = 1536;
+    constexpr auto N = 1152;
     constexpr auto K = 4096;
 
-    using inputValueType = cute::half_t;
+    using inputValueType = float;
     using outValueType = inputValueType;
     using weightValueType = inputValueType;
     using accumulateType = float;
@@ -261,8 +421,10 @@ void testCollective() {
         cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,cute::Stride<cute::Int<N>, cute::_1>>{});
 
     // bias vector (1, N) broadcast to (M, N)
+    /*const auto mD = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc + abcSize)),
+        cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,cute::Stride<cute::_0, cute::_1>>{});*/
     const auto mD = make_tensor(cute::make_gmem_ptr(CONST_CAST_TO(inputValueType, abc + abcSize)),
-        cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>>,cute::Stride<cute::_0, cute::_1>>{});
+        cute::Layout<cute::Shape<cute::_1, cute::Int<N>>, cute::Stride<cute::_0, cute::_1>>{});
 
     constexpr auto gemmSharedSize = sizeof(inputValueType) * Operation::GEMM::a_size
         + (sizeof(weightValueType) * Operation::GEMM::b_size);
@@ -270,13 +432,13 @@ void testCollective() {
     constexpr auto blocks = (M / cute::get<0>(Operation::BlockTiler{})) * (N / cute::get<1>(Operation::BlockTiler{}));
     #if MULTIPLE_TIMING
     for (uint i = 0; i < 128; ++i) {
-        deviceCollectiveMMA<M, N, K, Operation, sharedSize><<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD);
+        fGET<M, N, K, Operation, sharedSize, ResultType::local><<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD);
     }
     #endif
-    deviceCollectiveMMA<M, N, K, Operation, sharedSize, ResultType::local>
-    <<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD, false);
-    CHECK_LAST();
-    CHECK_ERROR_EXIT(cudaFree(abc));
+    fGET<M, N, K, Operation, sharedSize, ResultType::local><<<blocks, 128, 0, playStream>>>(mA, mB, mC, mD, false);
+    CHECK_ERROR_EXIT(cudaPeekAtLastError());
+    CHECK_ERROR_EXIT(cudaStreamSynchronize(playStream));
+    CHECK_ERROR_EXIT(cudaFreeAsync(abc, playStream));
     free(data);
 }
 
